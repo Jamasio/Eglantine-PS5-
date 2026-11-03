@@ -719,6 +719,9 @@ int main(int argc, char** argv) {
         // A hang kills the process with the log file half written; flush every line so eden_log.txt
         // keeps the last thing the guest did.
         Settings::values.log_flush_line.SetValue(true);
+        // Diagnostic build (branch mkw-no-mesh): the core skips task/mesh draws, to see whether they
+        // are what stops the GPU at Mario Kart World's title screen.
+        setenv("EDEN_NX2_NO_MESH", "1", 1);
 #endif
         Common::Log::Start();
         SCOPE_EXIT { Common::Log::Stop(); };
