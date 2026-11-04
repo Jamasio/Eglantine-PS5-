@@ -1,0 +1,14 @@
+{
+  "title_id": "PPSA98515",
+  "name": "EglantinePS5",
+  "status": "available",
+  "content_version": "01.206.001",
+  "version": "v206.001",
+  "format": "zip",
+  "artifact_url": "https://github.com/viejunerd/Eglantine-PS5-/releases/download/v206.001/EglantinePS5-v206.001.zip",
+  "sha256": "f2f8d1e48378b57c97e8512f9eaa24f65196d937cf97532423c2f74b1f80f509",
+  "size": 36763982,
+  "page": "https://github.com/viejunerd/Eglantine-PS5-/releases/tag/v206.001",
+  "release_notes": "- Update and DLC inside a NUP load, and the Library shows them\n- Core: Eglantine build 206 plus 7 commits (d9558f0)\n- From this version on, the app updates itself from this project's own releases\n- Version numbers follow Eglantine's build: v206.001",
+  "release_notes_truncated": false
+}
