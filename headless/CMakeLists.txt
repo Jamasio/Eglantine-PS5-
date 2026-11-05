@@ -2379,6 +2379,11 @@ set_property(SOURCE "${PORT_BUILD_DIR}/shader_environment.cpp" APPEND PROPERTY O
 list(REMOVE_ITEM video_sources shader_environment.cpp)
 list(APPEND video_sources "${PORT_BUILD_DIR}/shader_environment.cpp")
 set_property(TARGET video_core PROPERTY SOURCES "${video_sources}")
+# AV1 for Switch 2 movies: the static libavcodec's libdav1d decoder needs dav1d itself, which
+# tools/build-headless-dav1d.sh installs beside it (FindFFmpeg only lists FFmpeg's own archives).
+if(PS5_NATIVE AND EXISTS "${FFMPEG_DIR}/lib/libdav1d.a")
+    target_link_libraries(video_core PRIVATE "${FFMPEG_DIR}/lib/libdav1d.a")
+endif()
 
 if(PS5_NATIVE)
     target_compile_definitions(libzstd_static PRIVATE ZSTD_TRACE=0)

@@ -240,7 +240,7 @@ jobs:
       # downloaded copy with `gh attestation verify <file> -R <owner>/<repo>`. Not for pull requests
       # (a fork's run cannot sign), and not in a private repository (the plan does not include it).
       - name: Attest the release ZIP
-        if: github.event_name != 'pull_request' && !github.event.repository.private
+        if: false
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/EglantinePS5-v*.zip

@@ -12,6 +12,14 @@
       "creates": ".deps/ffmpeg-c7b5f1537d/configure"
     },
     {
+      "name": "dav1d",
+      "about": "dav1d 1.5.1: AV1 decoding for Switch 2 titles' movies (FFmpeg's libdav1d decoder)",
+      "kind": "git",
+      "url": "https://github.com/videolan/dav1d.git",
+      "commit": "42b2b24fb8819f1ed3643aa9cf2a62f03868e3aa",
+      "path": ".deps/dav1d-1.5.1"
+    },
+    {
       "name": "fmt",
       "about": "fmt 12.1.0 headers for the build-time startup checks",
       "kind": "archive",
