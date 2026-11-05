@@ -1149,7 +1149,8 @@ int main(int argc, char** argv) {
                 const auto fine_title = eden_game_title_id(guest);
                 bool fine = fine_title == 0x040074A01BF12000ULL || fine_title == 0x0400486024DEC000ULL;
                 if (const char* chosen = std::getenv("EDEN_CRAM_FINE")) fine = chosen[0] != '0';
-                ::Common::SetGuestMemoryFine(fine);
+                ::Common::SetGuestMemoryFine(fine ||
+                                         eden_game_title_id(guest) == 0x0400C3F00006E000ULL);
             }
 #endif
             Settings::values.use_asynchronous_shaders = speed.async_shaders;
