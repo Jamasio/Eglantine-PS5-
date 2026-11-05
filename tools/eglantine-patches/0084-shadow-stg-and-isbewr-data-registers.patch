@@ -1,0 +1,29 @@
+shader: shadow the data register of STG.U and ISBEWR
+
+The check that decides whether an instruction needs shadow registers skips bits 32-39
+unless the opcode is on a short list, and neither 0x986 (STG with a uniform address)
+nor 0x927 (ISBEWR) was on it. PrepareRegisterPressure already handles both. So a store
+whose data sat in R216-R245 stored the lowering's own uniform mirror, with no error,
+and data in R246 and up failed "native global store size".
+
+0x927: Lichii PR 100, c6f190548 by Zarigis. Ocarina's mesh 8159e91e0097876a stores R238
+and R240; the wrong value was a NaN on Link's door that bloom turned into a white glow.
+0x986: Lichii PR 65, d9748a5d5 by Zortos (Kirby white world). Its test uses a captured
+STG with data in R250.
+
+No effect on a program without such a store. Lichii's 0x987 is left out: not lowered
+here.
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index b9dccac..db69d14 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -265,7 +265,7 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+         bool requires_shadow = false;
+         for (u32 bit : {16U, 24U, 32U, 64U}) {
+             if (bit == 32 && insn.Bits(9, 3) != 1 && opcode != 0xb60 && opcode != 0xb66 && opcode != 0xf66 &&
+-                opcode != 0x988) continue;
++                opcode != 0x988 && opcode != 0x986 && opcode != 0x927) continue;
+             const u32 reg = insn.Bits(bit, 8);
+             if (reg >= shadow_boundary && reg < 255) requires_shadow = true;
+         }

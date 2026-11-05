@@ -1,0 +1,110 @@
+buffer_cache: download only the Preflushable pages of a GPU write at fences
+
+From Lichii PR 104 (fc12c793e, merge 0bf0f834b) by Zarigis. One hunk rewritten: our
+MarkWrittenBuffer adds the range through Nx2AddRangeOnce.
+
+A GPU write that covered any Preflushable page was queued whole. A native storage
+binding is sized from its mapping (up to 8 MiB since 2e12e0def), so one page the guest
+CPU had read sent the whole binding to a staging buffer at every fence. Run38 ran out
+of memory in that path: CreateStagingBuffer from CommitAsyncFlushesHigh. Upstream PR 609
+measured the same readback on Mario Kart World at 7.2-7.8 GiB/s. Now just the marked
+pages are queued and read traps are armed on the rest. The binding keeps its size, so
+no access is dropped, unlike PR 609.
+
+EDEN_NX2_EXACT_PREFLUSH=0 restores the old behaviour.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index a67c3fd..a33672d 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -335,11 +335,7 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
+         const DAddr diff = base_address - *cpu_src_address;
+         const DAddr new_base_address = *cpu_dest_address + diff;
+         tmp_intervals.push_back({new_base_address, size});
+-        if (DownloadsAtFence(new_base_address, size)) {
+-            uncommitted_gpu_modified_ranges.Add(new_base_address, size);
+-        } else {
+-            ArmReadTraps(new_base_address, size);
+-        }
++        QueueFenceDownload(new_base_address, size);
+     };
+     gpu_modified_ranges.ForEachInRange(*cpu_src_address, amount, mirror);
+     // This subtraction in this order is important for overlapping copies.
+@@ -1812,11 +1808,7 @@ void BufferCache<P>::MarkWrittenBuffer(BufferId buffer_id, DAddr device_addr, u3
+     MarkVertexBuffersStale(device_addr, size);
+     Nx2AddRangeOnce(gpu_modified_ranges, nx2_recent_gpu_ranges, nx2_recent_gpu_next, device_addr,
+                     size);
+-    if (DownloadsAtFence(device_addr, size)) {
+-        uncommitted_gpu_modified_ranges.Add(device_addr, size);
+-    } else {
+-        ArmReadTraps(device_addr, size);
+-    }
++    QueueFenceDownload(device_addr, size);
+     if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
+         Tegra::Nx2MarkGpuWritten(device_addr, size);
+         Nx2NoteListWrite(buffer_id, device_addr, size);
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 3773397..45ecd66 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -655,6 +655,41 @@ private:
+         return AsyncBufferDownloads() || memory_tracker.IsRegionPreflushable(device_addr, size);
+     }
+ 
++    /// Queues a GPU write for download at the next fence where DownloadsAtFence holds. With only
++    /// Preflushable marks, just the marked pages are queued: a write that covers one marked page
++    /// of a large buffer would otherwise copy the whole buffer back at every fence.
++    void QueueFenceDownload(DAddr device_addr, u64 size) {
++        static const bool exact = [] {
++            const char* value = std::getenv("EDEN_NX2_EXACT_PREFLUSH");
++            return value == nullptr || value[0] != '0';
++        }();
++        if (AsyncBufferDownloads()) {
++            uncommitted_gpu_modified_ranges.Add(device_addr, size);
++            return;
++        }
++        if (!exact) {
++            if (memory_tracker.IsRegionPreflushable(device_addr, size)) {
++                uncommitted_gpu_modified_ranges.Add(device_addr, size);
++            } else {
++                ArmReadTraps(device_addr, size);
++            }
++            return;
++        }
++        const DAddr end = device_addr + size;
++        u64 queued = 0;
++        memory_tracker.ForEachPreflushableRange(device_addr, size, [&](DAddr begin, u64 length) {
++            const DAddr lower = (std::max)(begin, device_addr);
++            const DAddr upper = (std::min)(begin + length, end);
++            if (lower < upper) {
++                uncommitted_gpu_modified_ranges.Add(lower, upper - lower);
++                queued += upper - lower;
++            }
++        });
++        if (queued < size) {
++            ArmReadTraps(device_addr, size);
++        }
++    }
++
+     /// GPU writes that are not downloaded at fences: trap the guest CPU's next read of their
+     /// pages, which flushes them once and marks them Preflushable (then DownloadsAtFence).
+     void ArmReadTraps(DAddr device_addr, u64 size) {
+diff --git a/src/video_core/buffer_cache/memory_tracker_base.h b/src/video_core/buffer_cache/memory_tracker_base.h
+index cf90e65..4a604f9 100644
+--- a/src/video_core/buffer_cache/memory_tracker_base.h
++++ b/src/video_core/buffer_cache/memory_tracker_base.h
+@@ -166,6 +166,14 @@ public:
+         });
+     }
+ 
++    /// Call 'func' for each range marked as Preflushable
++    template <typename Func>
++    void ForEachPreflushableRange(VAddr query_cpu_range, u64 query_size, Func&& func) {
++        IteratePages<false>(query_cpu_range, query_size, [&func](Manager* manager, u64 offset, size_t size) {
++            manager->ForEachModifiedRange(Type::Preflushable, false, manager->cpu_addr + offset, size, func);
++        });
++    }
++
+     /// Call 'func' for each GPU modified range and unmark those pages as GPU modified
+     template <typename Func>
+     void ForEachDownloadRange(VAddr query_cpu_range, u64 query_size, bool clear, Func&& func) {

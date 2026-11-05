@@ -1,0 +1,76 @@
+gpu: EDEN_NX2_GPU_TIME_DIV reports Switch 2 timestamps as nanoseconds
+
+After zortos293/Lichii #84 (2940d9fab) and #114 (01ee235c17, open), as a switch. Our report
+timestamps are GPU ticks / 256 under Boost, and Switch 2 titles read them as nanoseconds, so
+Ocarina's dynamic resolution sees almost no GPU time and stays at its top resolution. With the
+switch, timestamps are CoreTiming nanoseconds with the time since the last present divided by
+N: 1 is Lichii's nx2, 4 is #114. Unset changes nothing.
+
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index 28d133c..c18016b 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -9,6 +9,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <condition_variable>
++#include <cstdlib>
+ #include <list>
+ #include <memory>
+ #include <mutex>
+@@ -38,6 +39,7 @@
+ #include "video_core/host1x/host1x.h"
+ #include "video_core/host1x/syncpoint_manager.h"
+ #include "video_core/memory_manager.h"
++#include "video_core/nx2.h"
+ #include "video_core/renderer_base.h"
+ #include "video_core/shader_notify.h"
+ 
+@@ -54,6 +56,18 @@ constexpr u64 GpuClockMultiplier(Settings::GpuClock clock) {
+         return 1;
+     }
+ }
++
++// EDEN_NX2_GPU_TIME_DIV=N: Switch 2 report timestamps become CoreTiming nanoseconds, with the time
++// since the last present divided by N. 1 is real time, 4 is what Lichii's Boost uses. Unset keeps
++// the ticks below, which Switch 2 titles read as about 1/400 of real time: Ocarina of Time sizes
++// its dynamic resolution from GPU durations, so those ticks hold it at its top resolution.
++u64 Nx2GpuTimeDivisor() {
++    static const u64 divisor = [] {
++        const char* const value = std::getenv("EDEN_NX2_GPU_TIME_DIV");
++        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
++    }();
++    return divisor;
++}
+ } // Anonymous namespace
+ 
+ struct GPU::Impl {
+@@ -174,11 +188,20 @@ struct GPU::Impl {
+     }
+ 
+     [[nodiscard]] u64 GetTicks() const {
++        if (const u64 divisor = Nx2GpuTimeDivisor();
++            divisor != 0 && g_nx2_ampere.load(std::memory_order_relaxed)) {
++            // Never ahead of the CPU clock, and monotonic when the anchor moves.
++            const u64 now = static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count());
++            const u64 present = present_ns.load(std::memory_order_relaxed);
++            return now <= present ? now : present + (now - present) / divisor;
++        }
+         const u64 gpu_tick = system.CoreTiming().GetGPUTicks();
+         return gpu_tick / GpuClockMultiplier(Settings::values.gpu_clock.GetValue());
+     }
+ 
+     void RendererFrameEndNotify() {
++        present_ns.store(static_cast<u64>(system.CoreTiming().GetGlobalTimeNs().count()),
++                         std::memory_order_relaxed);
+         system.GetPerfStats().EndGameFrame();
+     }
+ 
+@@ -390,6 +413,7 @@ struct GPU::Impl {
+ 
+     std::list<std::function<void()>> sync_requests;
+     std::atomic<u64> current_sync_fence{};
++    std::atomic<u64> present_ns{};
+     u64 last_sync_fence{};
+ 
+     // Maps queued by MapInOrder and not run yet, by the GPU addresses they change.
