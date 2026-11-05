@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Vampinity <52834825+Vampinity@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 05:45:44 +0100
+Subject: [PATCH] puller: run pending fences on the split's back thread
+
+A semaphore acquire on the front called ReleaseFences directly. The fences reach
+the query cache and Scheduler::Record, which the back owns even once drained: its
+pre-sleep flush leaves the chunk null for a moment. Ocarina crashed there on the
+GPU thread at address 0x10 during its first cutscene.
+---
+ src/video_core/engines/puller.cpp | 21 +++++++++++++++------
+ 1 file changed, 15 insertions(+), 6 deletions(-)
+
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index 0ac798567f..53b6dee691 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -59,6 +59,15 @@ void DrainBack() {
+     VideoCommon::GpuSplit::Get().Drain();
+ }
+ 
++// The pending fences reach the query cache and the scheduler, which belong to the back thread even
++// when it has drained: it can still be submitting deferred work before it sleeps, and the
++// scheduler's chunk is empty for a moment then. Run them there and wait for them, so the caller
++// sees what they released.
++void ReleaseFencesOnBack(VideoCore::RasterizerInterface* rasterizer) {
++    OnBack([rasterizer] { rasterizer->ReleaseFences(); });
++    DrainBack();
++}
++
+ } // Anonymous namespace
+ 
+ bool Puller::PendingAcquire::Matches(u32 current) const {
+@@ -260,7 +269,7 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+         if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(acquire.address)) {
+             waiters.Add(this, *device, acquire.value, acquire.operation);
+         }
+-        dma_pusher.rasterizer->ReleaseFences();
++        ReleaseFencesOnBack(dma_pusher.rasterizer);
+         if (!waiters.Latched(this) && !acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address))) {
+             pending_acquire = acquire;
+             dma_pusher.suspensions.fetch_add(1, std::memory_order_release);
+@@ -278,19 +287,19 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
+                 regs.acquire_active = true;
+                 regs.acquire_mode = false;
+                 if (word != regs.acquire_value) {
+-                    dma_pusher.rasterizer->ReleaseFences();
++                    ReleaseFencesOnBack(dma_pusher.rasterizer);
+                     continue;
+                 }
+             } else if (op == GpuSemaphoreOperation::AcquireGequal) {
+                 regs.acquire_active = true;
+                 regs.acquire_mode = true;
+                 if (word < regs.acquire_value) {
+-                    dma_pusher.rasterizer->ReleaseFences();
++                    ReleaseFencesOnBack(dma_pusher.rasterizer);
+                     continue;
+                 }
+             } else if (op == GpuSemaphoreOperation::AcquireMask) {
+                 if (word && regs.semaphore_sequence == 0) {
+-                    dma_pusher.rasterizer->ReleaseFences();
++                    ReleaseFencesOnBack(dma_pusher.rasterizer);
+                     continue;
+                 }
+             } else {
+@@ -316,7 +325,7 @@ void Puller::ProcessSemaphoreAcquire(DmaPusher& dma_pusher) {
+     while (word != value) {
+         regs.acquire_active = true;
+         regs.acquire_value = value;
+-        dma_pusher.rasterizer->ReleaseFences();
++        ReleaseFencesOnBack(dma_pusher.rasterizer);
+         word = dma_pusher.memory_manager.Read<u32>(regs.semaphore_address.SemaphoreAddress());
+         // TODO(kemathe73) figure out how to do the acquire_timeout
+         regs.acquire_mode = false;
+@@ -340,7 +349,7 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+     }
+     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
+     DrainBack();
+-    dma_pusher.rasterizer->ReleaseFences();
++    ReleaseFencesOnBack(dma_pusher.rasterizer);
+     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
+     const bool ready = operation == 0   ? word == payload
+                        : operation == 2 ? word >= payload
