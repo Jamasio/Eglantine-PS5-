@@ -1,0 +1,58 @@
+diff --git a/src/video_core/renderer_vulkan/pipeline_helper.h b/src/video_core/renderer_vulkan/pipeline_helper.h
+index 07de25f18f..4bcb00b20e 100644
+--- a/src/video_core/renderer_vulkan/pipeline_helper.h
++++ b/src/video_core/renderer_vulkan/pipeline_helper.h
+@@ -143,6 +143,17 @@ inline void WriteDescriptorBuffer(const Device& device, const DescriptorBufferLa
+            Shader::NumDescriptors(info.image_descriptors);
+ }
+ 
++// ALL_GRAPHICS is the vertex/tessellation/geometry/fragment mask. Task and mesh programs read the
++// same rescaling push constants (texture and image scaling, with a resolution other than 1x), so
++// the range and the updates name their stages too where the device has them.
++// From heydemoura/EglantinePS5 core patch 0004.
++inline VkShaderStageFlags GraphicsPushConstantStages(const Device& device) {
++    return VK_SHADER_STAGE_ALL_GRAPHICS |
++           (device.IsExtMeshShaderSupported()
++                ? VK_SHADER_STAGE_TASK_BIT_EXT | VK_SHADER_STAGE_MESH_BIT_EXT
++                : 0U);
++}
++
+ class DescriptorLayoutBuilder {
+ public:
+     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
+@@ -248,7 +259,7 @@ public:
+         const u32 size_offset = is_compute ? sizeof(RescalingLayout::down_factor) : 0u;
+         const VkPushConstantRange range{
+             .stageFlags = static_cast<VkShaderStageFlags>(
+-                is_compute ? VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS),
++                is_compute ? VK_SHADER_STAGE_COMPUTE_BIT : GraphicsPushConstantStages(*device)),
+             .offset = 0,
+             .size = static_cast<u32>(sizeof(RescalingLayout)) - size_offset +
+                     static_cast<u32>(sizeof(RenderAreaLayout)),
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index cc5b785de8..76f7b7fe44 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -725,18 +725,18 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+             }
+             cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, *pipeline);
+         }
+-        cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
++        cmdbuf.PushConstants(*pipeline_layout, GraphicsPushConstantStages(device),
+                              RESCALING_LAYOUT_WORDS_OFFSET, sizeof(rescaling_data),
+                              rescaling_data.data());
+         if (update_rescaling) {
+             const f32 config_down_factor{Settings::values.resolution_info.down_factor};
+             const f32 scale_down_factor{is_rescaling ? config_down_factor : 1.0f};
+-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
++            cmdbuf.PushConstants(*pipeline_layout, GraphicsPushConstantStages(device),
+                                  RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(scale_down_factor),
+                                  &scale_down_factor);
+         }
+         if (uses_render_area) {
+-            cmdbuf.PushConstants(*pipeline_layout, VK_SHADER_STAGE_ALL_GRAPHICS,
++            cmdbuf.PushConstants(*pipeline_layout, GraphicsPushConstantStages(device),
+                                  RENDERAREA_LAYOUT_OFFSET, sizeof(render_area_data),
+                                  &render_area_data);
+         }
+

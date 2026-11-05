@@ -1,0 +1,92 @@
+dma_pusher: signal sync fences and flush GPU-written command lists on the back
+
+With the GPU thread split, two front paths drained the back and then used
+back-owned state directly. A Drain does not give the front ownership: the back's
+idle hook (FlushDeferred -> DispatchWork) can run after it, and the scheduler's
+chunk is empty for a moment then.
+- A synced submission called rasterizer->SignalFence (fence manager, scheduler).
+  The fence is now signalled on the back after the work sent so far, and
+  published at once, because the next Step waits for `synced`.
+- FlushGpuWrittenCommands flushed the buffer cache (downloads through the
+  scheduler) and noted the pages synced. That now runs on the back, and the
+  front waits for it with the drain it already did.
+With the split inactive, both run inline as before.
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 8e6bc5b843..e674b3f535 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -269,12 +269,22 @@ bool DmaPusher::Step() {
+     }
+ 
+     if (signal_sync) {
+-        VideoCommon::GpuSplit::Get().Drain();
+-        rasterizer->SignalFence([this]() {
+-            std::scoped_lock lk(sync_mutex);
+-            synced = true;
+-            sync_cv.notify_all();
+-        });
++        // The fence manager and the scheduler belong to the split's back, even once it has
++        // drained (its idle hook submits deferred work): signal the fence there, after the work
++        // sent so far. Published at once: the next Step waits for `synced`.
++        const auto signal = [this] {
++            rasterizer->SignalFence([this]() {
++                std::scoped_lock lk(sync_mutex);
++                synced = true;
++                sync_cv.notify_all();
++            });
++        };
++        if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
++            split.Defer(signal);
++            split.Publish();
++        } else {
++            signal();
++        }
+     }
+ 
+     return true;
+@@ -669,22 +679,31 @@ void DmaPusher::FlushGpuWrittenCommands(GPUVAddr address, size_t size) {
+     // The caches belong to the split's back: it first runs what the front queued (the dispatch
+     // that writes these words among it). The whole pages are flushed: their next lists read
+     // guest memory until GPU work writes them again.
+-    VideoCommon::GpuSplit::Get().Drain();
++    // The flush downloads through the scheduler, which the back owns even once it has drained:
++    // run it there and wait for it (the drain this needed anyway).
+     const GPUVAddr first_page = address & ~GPUVAddr{0xfff};
+     const GPUVAddr end_page = (address + size + 0xfff) & ~GPUVAddr{0xfff};
+-    if (memory_manager.IsMemoryDirty(first_page, end_page - first_page,
+-                                     VideoCommon::CacheType::BufferCache)) {
+-        memory_manager.FlushRegion(first_page, end_page - first_page,
+-                                   VideoCommon::CacheType::BufferCache);
+-    }
+-    if (rasterizer == nullptr) {
+-        return;
+-    }
+-    for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
+-        if (const auto device = memory_manager.GpuToCpuAddress(page);
+-            device && Tegra::Nx2IsCommandListPage(*device)) {
+-            rasterizer->NoteGpuWrittenCommandListSynced(*device);
++    const auto flush = [memory = &memory_manager, rasterizer_ = rasterizer, first_page, end_page] {
++        if (memory->IsMemoryDirty(first_page, end_page - first_page,
++                                  VideoCommon::CacheType::BufferCache)) {
++            memory->FlushRegion(first_page, end_page - first_page,
++                                VideoCommon::CacheType::BufferCache);
++        }
++        if (rasterizer_ == nullptr) {
++            return;
+         }
++        for (GPUVAddr page = first_page; page < end_page; page += 0x1000) {
++            if (const auto device = memory->GpuToCpuAddress(page);
++                device && Tegra::Nx2IsCommandListPage(*device)) {
++                rasterizer_->NoteGpuWrittenCommandListSynced(*device);
++            }
++        }
++    };
++    if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
++        split.Defer(flush);
++        split.Drain();
++    } else {
++        flush();
+     }
+ }
+

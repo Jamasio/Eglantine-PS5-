@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Vampinity <52834825+Vampinity@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 06:11:12 +0100
+Subject: [PATCH] kepler_compute: try the program's own handles before
+ Bananza's upscale slots
+
+---
+ src/video_core/engines/kepler_compute.cpp | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/engines/kepler_compute.cpp b/src/video_core/engines/kepler_compute.cpp
+index a2bbff27bb..6a3942bd36 100644
+--- a/src/video_core/engines/kepler_compute.cpp
++++ b/src/video_core/engines/kepler_compute.cpp
+@@ -968,10 +968,6 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+         output = image(0x348);
+         fortunes_weave = upscale_pair(input, output);
+     }
+-    if (!upscale_pair(input, output)) {
+-        input = image(0x60);
+-        output = image(0x70);
+-    }
+     if (!upscale_pair(input, output)) {
+         // The images the program itself uses: textures it reads and the surface it stores to
+         // through cbuf0 handles (Ocarina of Time's gameplay network reads +0xc0, writes +0xd0).
+@@ -995,6 +991,12 @@ bool KeplerCompute::UpscaleInsteadOfNativeProgram() {
+             if (input) break;
+         }
+     }
++    // Donkey Kong Bananza's slots, after the program's own handles: other titles keep unrelated
++    // images there.
++    if (!upscale_pair(input, output, false)) {
++        input = image(0x60);
++        output = image(0x70);
++    }
+     if (!upscale_pair(input, output, false)) {
+         input.reset();
+         output.reset();
