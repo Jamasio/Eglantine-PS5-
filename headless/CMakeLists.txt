@@ -146,18 +146,31 @@ write_derived("${PORT_BUILD_DIR}/sparse/common/sparse_large_vector.h" "${sparse_
 # before switching; jump_fcontext returns the live destination supplied by the
 # resumer, under that fiber's guard, just as the initial entry trampoline does.
 file(READ "${PROJECT_SOURCE_DIR}/src/common/fiber.cpp" fiber_source)
-string(REPLACE "    to.impl->previous_fiber = weak_from.lock();"
-    "    to.impl->previous_fiber = weak_from.lock();\n    ASSERT(to.impl->previous_fiber);\n    weak_from.reset();" fiber_source "${fiber_source}")
-string(REPLACE "    // \"from\" might no longer be valid if the thread was killed\n    if (auto from = weak_from.lock()) {"
-    "    if (auto* from = static_cast<Fiber*>(transfer.data)) {" fiber_source "${fiber_source}")
+# A plain string(REPLACE) that finds nothing leaves the build working and the change gone: when the
+# core moved the stack to a unique_ptr, 278 MiB of fiber stacks went back into the heap unnoticed.
+function(eden_fiber_replace old new)
+    string(REPLACE "${old}" "" without "${fiber_source}")
+    string(LENGTH "${fiber_source}" before)
+    string(LENGTH "${without}" after)
+    string(LENGTH "${old}" each)
+    math(EXPR found "(${before} - ${after}) / ${each}")
+    if(NOT found EQUAL 1)
+        message(FATAL_ERROR "Pinned fiber.cpp changed: ${found} of '${old}', expected 1")
+    endif()
+    string(REPLACE "${old}" "${new}" changed "${fiber_source}")
+    set(fiber_source "${changed}" PARENT_SCOPE)
+endfunction()
+eden_fiber_replace("    to.impl->previous_fiber = weak_from.lock();"
+    "    to.impl->previous_fiber = weak_from.lock();\n    ASSERT(to.impl->previous_fiber);\n    weak_from.reset();")
+eden_fiber_replace("    // \"from\" might no longer be valid if the thread was killed\n    if (auto from = weak_from.lock()) {"
+    "    if (auto* from = static_cast<Fiber*>(transfer.data)) {")
 if(PS5_NATIVE)
 # Native fibers keep their 2MiB usable stack, but reserve it in the CPU flexible pool.
 # ThreadToFiber needs only context bookkeeping and allocates no unused private stack.
-string(REPLACE "    std::array<u8, DEFAULT_STACK_SIZE> stack{};"
-    "    ::Eden::FiberStack stack;" fiber_source "${fiber_source}")
-string(REPLACE "    impl->stack_limit = impl->stack.data();"
-    "    impl->stack.Allocate(DEFAULT_STACK_SIZE);\n    impl->stack_limit = impl->stack.data();"
-    fiber_source "${fiber_source}")
+eden_fiber_replace("    std::unique_ptr<u8[]> stack;"
+    "    ::Eden::FiberStack stack;")
+eden_fiber_replace("    impl->stack.reset(new u8[DEFAULT_STACK_SIZE]);\n    impl->stack_limit = impl->stack.get();"
+    "    impl->stack.Allocate(DEFAULT_STACK_SIZE);\n    impl->stack_limit = impl->stack.data();")
 string(PREPEND fiber_source "#include \"${EDEN_PORT_DIR}/fiber_stack.h\"\n")
 endif()
 write_derived("${PORT_BUILD_DIR}/fiber.cpp" "${fiber_source}")

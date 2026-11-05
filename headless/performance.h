@@ -494,6 +494,11 @@ void ReportMemoryPressure(unsigned seconds);
 void ReportHeap(const char* why);
 // Gives the heap's empty spaces back to the pool; the bytes returned.
 std::size_t TrimHeap(const char* why);
+// A graphics allocation the pool refused (tools/prepare-vulkan-port.py, MemoryAllocator::ReportRefused):
+// whether this one gets the full report, and the pool's part of it: all that is free, not only the
+// largest block, and what the guest's memory took last.
+bool RefusalReportDue();
+void ReportPool();
 inline std::atomic<unsigned> capture_passes{};
 
 class Timer {

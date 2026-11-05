@@ -101,7 +101,46 @@ void RasterizerVulkan::DispatchCompute() {"""),
     # when the guest enables occlusion counting.
     ('const bool can_defer_clear = ENABLE_DEFERRED_CLEAR &&',
      'const bool can_defer_clear = ENABLE_DEFERRED_CLEAR && !regs.zpass_pixel_count_enable &&'),
-    ('#include <algorithm>', '#include <algorithm>\n#include "performance.h"'),
+    ('#include <algorithm>', '#include <algorithm>\n#include <thread>\n#include "performance.h"'),
+    # A refused allocation (MemoryAllocator::ReleaseRefused, ReportRefused) reaches the caches here.
+    # It can come from inside them, so their locks are only tried, and the staging pool, which has no
+    # lock, is touched only on the thread that runs it: the one that ticks it.
+    ('RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,',
+     'namespace {\n'
+     'std::atomic<std::thread::id> rasterizer_thread{};\n'
+     '}\n\n'
+     'RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra::GPU& gpu_,'),
+    ('    scheduler.SetQueryCache(query_cache);\n',
+     '''    scheduler.SetQueryCache(query_cache);
+    memory_allocator.SetRefusalHook([](void* argument, bool release) -> u64 {
+        auto* const self = static_cast<RasterizerVulkan*>(argument);
+        const bool owner = std::this_thread::get_id() == rasterizer_thread.load(std::memory_order_relaxed);
+        if (release) {
+            return owner ? self->staging_pool.ReleaseCompleted() : 0;
+        }
+        if (owner) {
+            self->staging_pool.ReportHeld();
+        } else {
+            std::fprintf(stderr, "EDEN_REFUSED_STAGING not read: refused on another thread\\n");
+        }
+        if (std::unique_lock lock{self->texture_cache.mutex, std::try_to_lock}; lock) {
+            self->texture_cache.ReportMemory();
+        } else {
+            std::fprintf(stderr, "EDEN_REFUSED_IMAGES not read: another thread holds the cache\\n");
+        }
+        if (std::unique_lock lock{self->buffer_cache.mutex, std::try_to_lock}; lock) {
+            self->buffer_cache.ReportMemory();
+        } else {
+            std::fprintf(stderr, "EDEN_REFUSED_BUFFERS not read: another thread holds the cache\\n");
+        }
+        return 0;
+    }, this);
+'''),
+    ('RasterizerVulkan::~RasterizerVulkan() {\n',
+     'RasterizerVulkan::~RasterizerVulkan() {\n    memory_allocator.SetRefusalHook(nullptr, nullptr);\n'),
+    ('    staging_pool.TickFrame();\n',
+     '    rasterizer_thread.store(std::this_thread::get_id(), std::memory_order_relaxed);\n'
+     '    staging_pool.TickFrame();\n'),
     # Guest threads take the cache locks here (tracked-page writes, flush-area reads).
     ('bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {',
      'bool RasterizerVulkan::OnCPUWrite(DAddr addr, u64 size) {\n    ::Eden::Performance::Timer guest_write_timer(::Eden::Performance::guest_cpu_write);'),
@@ -442,8 +481,9 @@ adapt('src/video_core/renderer_vulkan/vk_present_manager.cpp', 'vulkan_present_m
 # driver counts each allocation twice (as VRAM and as visible VRAM), so the budget of the 8 GiB heap
 # is used up at about 4 GiB, and it knows nothing of the pool the CPU shares. Eden asks for images
 # and buffers within the budget and takes a refusal as final. A refused image or buffer is asked for
-# again outside the budget; the driver refuses when the pool has no room, which is still the end of
-# the session, and stderr.log then says what the pool had.
+# again outside the budget. When the driver refuses that too, the staging the GPU is done with and the
+# heap's empty spaces go back and it is asked for once more; refused then, the session ends cleanly
+# (a buffer has no fallback), and stderr.log says what held the pool (MemoryAllocator::ReportRefused).
 ALLOCATOR_REFUSED = """    VkResult created = CALL;
     if (created != VK_SUCCESS) {
         VmaAllocationCreateInfo outside_budget = alloc_ci;
@@ -473,6 +513,13 @@ ALLOCATOR_REFUSED = """    VkResult created = CALL;
                          static_cast<unsigned long long>(guest_held >> 20),
                          static_cast<unsigned long long>(eden_heap_committed() >> 20));
             ::Eden::Performance::ReportHeap("a buffer was refused");
+            if (ReleaseRefused("a buffer was refused") != 0) {
+                created = AGAIN;
+                std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY asked once more: result %d, DETAIL\\n", int(created), VALUES);
+            }
+            if (created != VK_SUCCESS) {
+                ReportRefused();
+            }
         }
     }
     vk::Check(created);
@@ -487,11 +534,26 @@ adapt('src/video_core/vulkan_common/vulkan_memory_allocator.h',
     ('#pragma once', '#pragma once\n#include <array>\n#include <mutex>'),
     ('        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;',
      '        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;\n'
-     '        vk::Image CreateTemporaryImage(const VkImageCreateInfo &ci) const;'),
+     '        vk::Image CreateTemporaryImage(const VkImageCreateInfo &ci) const;\n\n'
+     '        /// The way to what the caches hold, for an allocation the pool refused: with `release`,\n'
+     '        /// lets go of what the GPU is done with and gives the bytes; without, reports what they\n'
+     '        /// hold. Set by the rasterizer, on any thread that is refused.\n'
+     '        using RefusalHook = u64 (*)(void* context, bool release);\n'
+     '        void SetRefusalHook(RefusalHook hook, void* context) noexcept;'),
+    ('        static bool IsAutoUsage(VmaMemoryUsage u) noexcept {',
+     '        u64 ReleaseRefused(const char* why) const;\n'
+     '        void ReportRefused() const;\n'
+     '        bool NoFallbackLeft(const VkImageCreateInfo& ci) const;\n\n'
+     '        static bool IsAutoUsage(VmaMemoryUsage u) noexcept {'),
     ('        u32 valid_memory_types{~0u};',
      '        u32 valid_memory_types{~0u};\n'
      '        mutable std::mutex temporary_pool_mutex;\n'
-     '        mutable std::array<VmaPool, VK_MAX_MEMORY_TYPES> temporary_pools{};'),
+     '        mutable std::array<VmaPool, VK_MAX_MEMORY_TYPES> temporary_pools{};\n'
+     '        std::atomic<RefusalHook> refusal_hook{nullptr};\n'
+     '        void* refusal_context{};\n'
+     '        /// Images the pool found nothing for, and since when (NoFallbackLeft).\n'
+     '        mutable std::atomic<u32> images_refused{0};\n'
+     '        mutable std::atomic<long long> images_refused_since{0};'),
 ])
 adapt('src/video_core/vulkan_common/vulkan_memory_allocator.cpp', 'vulkan_memory_allocator.cpp', [
     ('            vmaCalculateStatistics(allocator, &statistics);',
@@ -536,9 +598,94 @@ MemoryAllocator::MemoryAllocator(const Device &device_)'''),
      '    if (vma_probe_allocator == allocator) vma_probe_allocator = nullptr;\n'
      '    for (auto pool : temporary_pools) if (pool) vmaDestroyPool(allocator, pool);\n' +
      ('    DestroySparsePools();\n' if 'DestroySparsePools' in (source / 'src/video_core/vulkan_common/vulkan_memory_allocator.h').read_text() else '') +
-     '}'),
+     '''}
+
+void MemoryAllocator::SetRefusalHook(RefusalHook hook, void* context) noexcept {
+    refusal_context = context;
+    refusal_hook.store(hook, std::memory_order_release);
+}
+
+u64 MemoryAllocator::ReleaseRefused(const char* why) const {
+    const auto hook = refusal_hook.load(std::memory_order_acquire);
+    const u64 staging = hook ? hook(refusal_context, true) : 0;
+    const u64 heap = ::Eden::Performance::TrimHeap(why);
+    std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY %s: %llu MiB of finished staging and %llu MiB of the heap went back\\n",
+                 why, static_cast<unsigned long long>(staging >> 20), static_cast<unsigned long long>(heap >> 20));
+    return staging + heap;
+}
+
+// What held the pool when it refused: the pool, the guest's memory, the allocator's blocks by memory
+// type, then the caches. The periodic reports miss a burst that takes seconds. It takes no large
+// block of its own, because the pool has none to give (so no vmaBuildStatsString here).
+void MemoryAllocator::ReportRefused() const {
+    if (!::Eden::Performance::RefusalReportDue()) {
+        return;
+    }
+    ::Eden::Performance::ReportPool();
+    VmaTotalStatistics held{};
+    vmaCalculateStatistics(allocator, &held);
+    for (u32 type = 0; type < properties.memoryTypeCount; ++type) {
+        const VmaDetailedStatistics& kind = held.memoryType[type];
+        if (kind.statistics.blockCount == 0) {
+            continue;
+        }
+        std::fprintf(stderr, "EDEN_REFUSED_VMA type %u (flags 0x%x): %u blocks %llu MiB, %u allocations %llu MiB, the "
+                     "largest %llu MiB; %u holes, the largest %llu MiB\\n",
+                     type, unsigned(properties.memoryTypes[type].propertyFlags), kind.statistics.blockCount,
+                     static_cast<unsigned long long>(kind.statistics.blockBytes >> 20), kind.statistics.allocationCount,
+                     static_cast<unsigned long long>(kind.statistics.allocationBytes >> 20),
+                     static_cast<unsigned long long>(kind.allocationSizeMax >> 20), kind.unusedRangeCount,
+                     static_cast<unsigned long long>(kind.unusedRangeSizeMax >> 20));
+    }
+    if (const auto hook = refusal_hook.load(std::memory_order_acquire)) {
+        hook(refusal_context, false);
+    }
+}
+
+// Whether a refused image ends the session instead of going to the fallback with nothing bound.
+// EDEN_NX2_UNBACKED_LIMIT=<images> in 2 s, 0: never.
+bool MemoryAllocator::NoFallbackLeft(const VkImageCreateInfo& ci) const {
+    static const u32 limit = [] {
+        const char* value = std::getenv("EDEN_NX2_UNBACKED_LIMIT");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 8U;
+    }();
+    const long long now = ::Eden::Performance::NowNs();
+    if (now - images_refused_since.load(std::memory_order_relaxed) > 2'000'000'000) {
+        images_refused_since.store(now, std::memory_order_relaxed);
+        images_refused.store(0, std::memory_order_relaxed);
+    }
+    const u32 refused = images_refused.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool ends = limit != 0 && refused >= limit;
+    std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY image %ux%ux%u, %u layers, %u levels, format %d found no memory: %u in 2 s, "
+                 "limit %u%s\\n", ci.extent.width, ci.extent.height, ci.extent.depth, ci.arrayLayers, ci.mipLevels,
+                 int(ci.format), refused, limit, ends ? ", the session ends" : "");
+    return ends;
+}'''),
     ('#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n',
      '#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n#include <atomic>\n#include <cstddef>\n#include <cstdio>\n#include <cstring>\n#include <cstdlib>\n#include "performance.h"\nnamespace Common { void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept; }\nextern "C" std::size_t eden_heap_committed(void);\n'),
+    # An image the pool could not hold would be made with nothing bound: reads give zero, writes are
+    # lost, and Eden's comment above says AMD's drivers do not survive sampling one. So it gets what a
+    # buffer gets, and only then the fallback. The fallback stays: now and then an image too big for
+    # what is left is no sign of the end (Ocarina, 2026-11-05: a 288 MiB depth image at 426 s, and the
+    # session went on for 235 s). Many in a short time are: small images can still fit while each
+    # frame's 13 MiB depth buffer does not (11 in the session's last second), and a session a retry
+    # keeps alive would go on drawing into images with nothing behind them. The collector gets those
+    # frames to free memory; then the session ends as it does for a buffer.
+    ('    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D) {\n',
+     '''    bool no_fallback = false;
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
+        if (ReleaseRefused("an image was refused") != 0) {
+            VmaAllocationCreateInfo once_more = alloc_ci;
+            once_more.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateImage(allocator, &ci, &once_more, &handle, &allocation, &alloc_info);
+        }
+        if (result != VK_SUCCESS) {
+            no_fallback = NoFallbackLeft(ci);
+            ReportRefused();
+        }
+    }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D && !no_fallback) {
+'''),
     # What an image was that the allocator could not make at all, for stderr.log.
     ('    if (result != VK_SUCCESS) {\n        LOG_CRITICAL(Render_Vulkan, "Image {}x{}x{} ({} levels, {} layers, format {}) failed: {}",',
      """    if (result != VK_SUCCESS) {
@@ -600,7 +747,8 @@ MemoryAllocator::MemoryAllocator(const Device &device_)'''),
 # 480 MiB free. No Finish() when releasing: a buffer handed out earlier may not have its copy recorded.
 adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.h',
       'include/video_core/renderer_vulkan/vk_staging_buffer_pool.h', [
-    ('    void TickFrame();\n', '    void TickFrame();\n    void ReleaseCompleted();\n'),
+    ('    void TickFrame();\n',
+     '    void TickFrame();\n    std::uint64_t ReleaseCompleted();\n    void ReportHeld();\n'),
 ])
 adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_staging_buffer_pool.cpp', [
     ('StagingBufferRef StagingBufferPool::CreateStagingBuffer(size_t size, MemoryUsage usage, bool deferred) {',
@@ -627,15 +775,45 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
     ('#include "video_core/vulkan_common/vulkan_wrapper.h"\n',
      '#include "video_core/vulkan_common/vulkan_wrapper.h"\n#include <atomic>\n#include <cstdio>\n#include "staging_buffers.h"\n'),
     ('void StagingBufferPool::TickFrame() {',
-     'void StagingBufferPool::ReleaseCompleted() {\n'
+     '''void StagingBufferPool::ReportHeld() {
+    const char* name = "device";
+    for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        size_t count = 0, pinned = 0, busy = 0;
+        unsigned long long bytes = 0, idle = 0;
+        for (const StagingBuffers& level : *cache) {
+            for (const StagingBuffer& entry : level.entries) {
+                const auto held = ::Eden::StagingBuffers::Holds(entry.mapped_span.size(), entry.log2_level);
+                ++count;
+                bytes += held;
+                if (entry.deferred) {
+                    ++pinned;
+                } else if (scheduler.IsFree(entry.tick)) {
+                    idle += held;
+                } else {
+                    ++busy;
+                }
+            }
+        }
+        std::fprintf(stderr, "EDEN_REFUSED_STAGING %s: %zu buffers hold %llu MiB, %llu MiB finished; %zu pinned, %zu with "
+                     "the GPU\\n", name, count, bytes >> 20, idle >> 20, pinned, busy);
+        name = cache == &device_local_cache ? "upload" : "download";
+    }
+    std::fprintf(stderr, "EDEN_REFUSED_STAGING stream: %llu MiB\\n",
+                 static_cast<unsigned long long>(stream_buffer_size >> 20));
+}
+
+'''
+     'std::uint64_t StagingBufferPool::ReleaseCompleted() {\n'
      '    const auto idle = [this](const StagingBuffer& entry) {\n'
      '        return !entry.deferred && scheduler.IsFree(entry.tick);\n'
      '    };\n'
+     '    ::Eden::StagingBuffers::Released released;\n'
      '    for (StagingBuffersCache* const cache : {&device_local_cache, &upload_cache, &download_cache}) {\n'
      '        for (StagingBuffers& level : *cache) {\n'
-     '            ::Eden::StagingBuffers::ReleaseFrom(level, idle);\n'
+     '            released += ::Eden::StagingBuffers::ReleaseFrom(level, idle);\n'
      '        }\n'
      '    }\n'
+     '    return released.bytes;\n'
      '}\n\nvoid StagingBufferPool::TickFrame() {'),
     ('    const auto is_free = [this](const StagingBuffer& entry) {\n'
      '        return !entry.deferred && scheduler.IsFree(entry.tick);\n'

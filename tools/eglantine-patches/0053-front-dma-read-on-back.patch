@@ -1,0 +1,44 @@
+maxwell_3d: flush a front macro's DMA read on the split's back thread
+
+FrontDmaRead (MME_DMA_READ / _FIFOED from macros run on the front with
+EDEN_NX2_SPLIT=2) drained the back, then flushed the buffer cache on the front.
+The flush downloads through the Vulkan scheduler, which the back owns even
+once it has drained: its idle hook (FlushDeferred -> DispatchWork) can run then,
+and the scheduler's chunk is empty for a moment. That is the race of 0041 and
+0045. The flush now runs on the back, after the methods queued before the read,
+and the front waits for it with the drain it already did, then reads guest
+memory. FrontDmaRead only runs with the split active.
+
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index bff0787bc9..1bb1e6853d 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -1154,8 +1154,9 @@ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split
+ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
+                              u32 count) {
+     // The words may be written by methods still queued for the back (indirect draw arguments
+-    // from a culling dispatch), and the caches that may hold newer ones belong to it.
+-    split.Drain();
++    // from a culling dispatch), and the caches that may hold newer ones belong to it. The flush
++    // downloads through the scheduler, which the back owns even once it has drained (its idle
++    // hook submits deferred work): run it there, after those methods, and wait for it.
+     const GPUVAddr source = (GPUVAddr{fs.regs[0x154] & 0x1ffffff} << 32) | fs.regs[0x155];
+     const u32 ram = fs.regs[0x156];
+     const u32 words = std::min<u32>(count, 0x1000);
+@@ -1163,9 +1164,12 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+     if (VideoCommon::Nx2Profile::Enabled()) {
+         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+     }
+-    if (memory_manager.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+-        memory_manager.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
+-    }
++    split.Defer([memory = &memory_manager, source, read_bytes] {
++        if (memory->IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
++            memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
++        }
++    });
++    split.Drain();
+     for (u32 i = 0; i < words; ++i) {
+         const u32 word = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
+         if (method == 0x158) {
+

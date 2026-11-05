@@ -4,11 +4,12 @@
 
   python3 -I tools/symbolize-sites.py STDERR_LOG build/headless-native/llvm-pie.elf
 
-stderr.log has two kinds of lines, each with the return addresses found on the stack of the code that
+stderr.log has three kinds of lines, each with the return addresses found on the stack of the code that
 asked for the memory (offsets from the image's start, as in a crash report):
 
   EDEN_HEAP_SITE <MiB> MiB in <n> blocks: <offsets>   a place that holds heap memory alive
   EDEN_CRAM_WRITER <n>: <offsets>                      a place that wrote guest memory (<n> slots)
+  EDEN_GUEST_GROWTH_WRITER <n>MiB: <offsets>           the same in the minute before a refused allocation
 
 The app's code is execute-only on the console, so the app cannot check that an address follows a call.
 That is done here, with the image: addresses whose previous instruction is not a call are stale words of
@@ -97,6 +98,12 @@ def main():
             writers = []
         elif line.startswith('EDEN_CRAM_WRITER '):
             writers.append(line)
+    growth = []
+    for line in log.read_text(errors='replace').splitlines():
+        if line.startswith('EDEN_GUEST_GROWTH held'):
+            growth = []
+        elif line.startswith('EDEN_GUEST_GROWTH_WRITER '):
+            growth.append(line)
 
     cache = {}
 
@@ -128,6 +135,8 @@ def main():
 
     show('Heap, largest places alive (MiB in blocks):', heap_block, r'EDEN_HEAP_SITE (\d+ MiB in \d+ blocks): (.*)')
     show('Guest memory, writers (slots promoted):', writers, r'EDEN_CRAM_WRITER (\d+): (.*)')
+    show('Guest memory, the minute before the last refusal:', growth,
+         r'EDEN_GUEST_GROWTH_WRITER (\d+MiB): ([0-9a-f ]+)$')
 
 
 if __name__ == '__main__':

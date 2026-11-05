@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstring>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -14,6 +15,13 @@ namespace Eden {
 // Keep the full guest-callback stack size. Anonymous CPU mappings use the console's
 // flexible pool, leaving direct memory for guest RAM and GPU resources. Guard pages
 // surround the usable stack. Exhaustion falls back to the existing heap domain.
+//
+// The pool is a few hundred MiB, and whatever else maps anonymous memory shares it. Each stack also
+// asks for PoolFloor on the side and gives it straight back, so the stacks stop while that much is
+// left. Both are read-write from the start: that is the request the pool is known to refuse when it
+// has no room (the GPU's 1 GiB table, CMakeLists.txt), and a refusal sends a stack to the heap.
+// Only whole mappings go back: part of one has never been given back on the console, and fibers are
+// made in every session.
 class FiberStack {
 public:
     FiberStack() = default;
@@ -32,15 +40,20 @@ public:
     void Allocate(std::size_t size) {
         if (!size || size % GuardBytes || bytes) std::abort();
         bytes = size;
-        void* reserved = mmap(nullptr, bytes + 2 * GuardBytes, PROT_NONE,
-                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        const std::size_t span = bytes + 2 * GuardBytes;
+        void* reserved = Map(span);
         if (reserved != MAP_FAILED) {
-            auto* usable = static_cast<unsigned char*>(reserved) + GuardBytes;
-            if (mprotect(usable, bytes, PROT_READ | PROT_WRITE) == 0) {
+            auto* first = static_cast<unsigned char*>(reserved);
+            auto* usable = first + GuardBytes;
+            void* spare = Map(PoolFloor);
+            const bool room = spare != MAP_FAILED;
+            if (room && munmap(spare, PoolFloor)) std::abort();
+            if (room && CpuRange(reserved, span) && mprotect(first, GuardBytes, PROT_NONE) == 0 &&
+                mprotect(usable + bytes, GuardBytes, PROT_NONE) == 0) {
                 mapping = reserved;
                 base = usable;
                 flexible_bytes.fetch_add(bytes, std::memory_order_relaxed);
-            } else if (munmap(reserved, bytes + 2 * GuardBytes)) {
+            } else if (munmap(reserved, span)) {
                 std::abort();
             }
         }
@@ -65,6 +78,18 @@ private:
     inline static constexpr std::array<unsigned long long, 2> Canary{
         0x8d569a12e3c047bfULL, 0x729db60f24e1ac83ULL};
     static constexpr std::size_t CanaryBytes = sizeof(Canary);
+    static constexpr std::size_t PoolFloor = std::size_t{64} << 20;
+    // As the app's other CPU memory (src/memory_pages.cpp): a mapping that names no address goes
+    // to RADV's 32-bit window at 0x2_0000_0000, and the driver's device memory starts at 0x40_0000_0000.
+    static constexpr std::uintptr_t MappingHint = 0x1000000000ull;
+    static void* Map(std::size_t size) noexcept {
+        return mmap(reinterpret_cast<void*>(MappingHint), size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    }
+    static bool CpuRange(const void* at, std::size_t size) noexcept {
+        const auto start = reinterpret_cast<std::uintptr_t>(at);
+        return start >= 0x300000000ull && start <= 0x4000000000ull - size;
+    }
     void* mapping{};
     unsigned char* base{};
     std::size_t bytes{};

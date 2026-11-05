@@ -1,0 +1,25 @@
+From 910593866abcfd1441db98c302649798f129738b Mon Sep 17 00:00:00 2001
+From: exploitizm <351399878+exploitizm@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 12:56:13 +1000
+Subject: [PATCH] Size kernel reference-count tables to managed regions
+
+Adapt the sizing optimization from original PS5 patch 0014. Reference-count indices are relative to each manager's heap, so allocate entries for that region rather than all intended DRAM. Preserve existing zero and dirty-page tracking.
+---
+ src/core/hle/kernel/k_memory_manager.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/core/hle/kernel/k_memory_manager.cpp b/src/core/hle/kernel/k_memory_manager.cpp
+index e77a210ac9..cb5ea2bfe2 100644
+--- a/src/core/hle/kernel/k_memory_manager.cpp
++++ b/src/core/hle/kernel/k_memory_manager.cpp
+@@ -466,8 +466,8 @@ size_t KMemoryManager::Impl::Initialize(KPhysicalAddress address, size_t size,
+     // Setup region.
+     m_pool = p;
+     m_management_region = management;
+-    m_page_reference_counts.resize(
+-        Kernel::Board::Nintendo::Nx::KSystemControl::Init::GetIntendedMemorySize() / PageSize);
++    // Reference-count indices are offsets within this manager's region, not all of DRAM.
++    m_page_reference_counts.resize(size / PageSize);
+     ASSERT(Common::IsAligned(GetInteger(m_management_region), PageSize));
+ 
+     // Initialize the manager's KPageHeap.

@@ -457,7 +457,28 @@ std::atomic<std::uint64_t> promotions_in_app_code{0}, promotions_elsewhere{0};
 thread_local std::uintptr_t fault_pcs[WriterPcs] = {};
 thread_local bool fault_in_app_code = false;
 
-void NoteWriter() noexcept {
+// The latest promotions, one word each so that a fault handler can write one and a report read it
+// without a lock: the slot, the writer's place in writer_sites (WriterSites: no place left), whether
+// the app's code wrote, and when (eden_guest_memory_growth). The counts above are for the whole
+// session; when the pool runs out the question is what the last few hundred MiB went to.
+constexpr std::size_t RecentCount = 1024; // 2 GiB of slots
+constexpr unsigned RecentSlotBits = 16, RecentSiteBits = 10, RecentTimeShift = RecentSlotBits + RecentSiteBits + 1;
+static_assert(WriterSites < (1u << RecentSiteBits));
+std::atomic<std::uint64_t> recent_promotions[RecentCount];
+std::atomic<std::uint64_t> recent_total{0};
+std::uint64_t MonotonicMs() noexcept {
+    timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return static_cast<std::uint64_t>(now.tv_sec) * 1000 + static_cast<std::uint64_t>(now.tv_nsec) / 1000000;
+}
+void NoteRecent(std::size_t slot, std::size_t site) noexcept {
+    const std::uint64_t word = MonotonicMs() << RecentTimeShift |
+                               std::uint64_t{fault_in_app_code} << (RecentSlotBits + RecentSiteBits) |
+                               std::uint64_t{site} << RecentSlotBits | (slot & ((1u << RecentSlotBits) - 1));
+    recent_promotions[recent_total.fetch_add(1, std::memory_order_relaxed) % RecentCount].store(word, std::memory_order_relaxed);
+}
+
+void NoteWriter(std::size_t slot) noexcept {
     (fault_in_app_code ? promotions_in_app_code : promotions_elsewhere).fetch_add(1, std::memory_order_relaxed);
     std::uintptr_t key = 0xCBF29CE484222325ull;
     for (const std::uintptr_t pc : fault_pcs) key = (key ^ pc) * 0x100000001B3ull;
@@ -468,13 +489,16 @@ void NoteWriter() noexcept {
         if (writer_sites[at].key.compare_exchange_strong(expected, key, std::memory_order_acq_rel)) {
             for (std::size_t i = 0; i < WriterPcs; ++i) writer_sites[at].pcs[i] = fault_pcs[i];
             writer_sites[at].count.fetch_add(1, std::memory_order_relaxed);
+            NoteRecent(slot, at);
             return;
         }
         if (expected == key) {
             writer_sites[at].count.fetch_add(1, std::memory_order_relaxed);
+            NoteRecent(slot, at);
             return;
         }
     }
+    NoteRecent(slot, WriterSites);
 }
 } // namespace
 
@@ -598,11 +622,12 @@ bool HandleGuestWriteFault(void* fault) noexcept {
         bool done = true;
         if (state == SlotFine) {
             done = PromoteFine(*range, slot);
+            if (done) NoteWriter(slot);
         } else if (state == SlotZero) {
             done = PromoteZero(*range, slot);
             if (done) {
                 counters.promotions.fetch_add(1, std::memory_order_relaxed);
-                NoteWriter();
+                NoteWriter(slot);
             }
         } else if (state == SlotShared) {
             done = PromoteShared(*range, slot);
@@ -874,8 +899,11 @@ void ScanPass(SparseRange& range) noexcept {
 void ServiceReport(SparseRange& range, const char* when) noexcept {
     const std::size_t slots = (range.end - range.begin.load(std::memory_order_relaxed)) / SparseSlot;
     std::size_t own = 0, shared = 0, fine = 0, fine_kept = 0;
+    constexpr std::size_t SlotsPerGiB = (std::size_t{1} << 30) / SparseSlot;
+    unsigned held_per_gib[32]{};
     for (std::size_t slot = 0; slot < slots; ++slot) {
         const auto state = SlotState(range, slot);
+        if (state != SlotZero) ++held_per_gib[std::min<std::size_t>(slot / SlotsPerGiB, 31)];
         own += state == SlotOwn;
         shared += state == SlotShared;
         if (state == SlotFine) {
@@ -901,12 +929,27 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         reserve_count.load(std::memory_order_relaxed) * (SparseSlot >> 20),
         (unsigned long long)counters.host_reserve_used.load() * (SparseSlot >> 20));
     if (length > 0) Report(line);
-    // Who wrote the slots that were promoted: the largest places (offsets in the app's image).
-    struct Top { const WriterSite* site; std::uint64_t count; } top[10]{};
+    // Where the slots lie, per GiB of the guest's memory: the kernel's pools are apart here (the
+    // game's at the top, then the applets', then the system's, whose end nx2:gpu's blocks come from).
+    char map[256];
+    int mapped = std::snprintf(map, sizeof(map), "EDEN_CRAM_MAP slots held per GiB:");
+    for (std::size_t gib = 0; gib * SlotsPerGiB < slots && gib < 32 && mapped > 0 &&
+                              static_cast<std::size_t>(mapped) < sizeof(map) - 8; ++gib)
+        mapped += std::snprintf(map + mapped, sizeof(map) - mapped, " %u", held_per_gib[gib]);
+    if (mapped > 0 && static_cast<std::size_t>(mapped) < sizeof(map) - 2) {
+        map[mapped++] = '\n';
+        map[mapped] = 0;
+        Report(map);
+    }
+    // Who wrote the slots that were promoted: the largest places (offsets in the app's image). A
+    // writer's place comes from what lies on its stack, so one path can show as several: the first
+    // load of a scene is spread over many places with under 30 slots each.
+    constexpr std::size_t TopWriters = 24;
+    struct Top { const WriterSite* site; std::uint64_t count; } top[TopWriters]{};
     for (const WriterSite& site : writer_sites) {
         const std::uint64_t count = site.count.load(std::memory_order_relaxed);
-        if (site.key.load(std::memory_order_relaxed) == 0 || count <= top[9].count) continue;
-        std::size_t place = 9;
+        if (site.key.load(std::memory_order_relaxed) == 0 || count <= top[TopWriters - 1].count) continue;
+        std::size_t place = TopWriters - 1;
         while (place > 0 && top[place - 1].count < count) {
             top[place] = top[place - 1];
             --place;
@@ -934,6 +977,75 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
     }
 }
 
+} // namespace
+
+// What the guest's memory took last, for a graphics allocation the pool refused
+// (headless/performance.cpp, ReportPool): the Zero and Fine slots a write made Own, each a whole block
+// from the pool, which is what adds to it while the service runs (Shared slots are off unless asked
+// for). A slot is a part of the guest's backing, so a range here is a physical range of the guest,
+// not a guest address.
+extern "C" void eden_guest_memory_growth(void) noexcept {
+    SparseRange* const range = service_range.load(std::memory_order_acquire);
+    if (range == nullptr) return;
+    ServiceReport(*range, "refusal");
+    constexpr std::uint64_t WindowMs = 60000;
+    constexpr std::size_t RangeSlots = 128; // 256 MiB of backing
+    constexpr std::size_t Ranges = 256;
+    std::uint16_t by_site[WriterSites + 1] = {}, by_range[Ranges] = {};
+    std::size_t last_5s = 0, last_20s = 0, last_60s = 0, by_app = 0, read = 0;
+    std::uint64_t oldest_ms = 0;
+    const std::uint64_t total = recent_total.load(std::memory_order_acquire), now = MonotonicMs();
+    const std::size_t kept = static_cast<std::size_t>(std::min<std::uint64_t>(total, RecentCount));
+    for (; read < kept; ++read) {
+        const std::uint64_t word = recent_promotions[(total - 1 - read) % RecentCount].load(std::memory_order_relaxed);
+        const std::uint64_t taken = word >> RecentTimeShift;
+        const std::uint64_t age = now > taken ? now - taken : 0;
+        if (age > WindowMs) break;
+        oldest_ms = age;
+        ++last_60s;
+        last_20s += age <= 20000;
+        last_5s += age <= 5000;
+        by_app += (word >> (RecentSlotBits + RecentSiteBits)) & 1;
+        ++by_site[(word >> RecentSlotBits) & ((1u << RecentSiteBits) - 1)];
+        ++by_range[std::min<std::size_t>((word & ((1u << RecentSlotBits) - 1)) / RangeSlots, Ranges - 1)];
+    }
+    constexpr std::size_t SlotMiB = SparseSlot >> 20;
+    char line[320];
+    int length = std::snprintf(line, sizeof(line),
+        "EDEN_GUEST_GROWTH held=%zuMiB: slots taken in the last 5 s %zuMiB, 20 s %zuMiB, 60 s %zuMiB (%zuMiB by code of the "
+        "app, %zuMiB by other code); %zu kept, the oldest read %llu ms ago; %llu in the session\n",
+        guest_committed.load(std::memory_order_relaxed) >> 20, last_5s * SlotMiB, last_20s * SlotMiB, last_60s * SlotMiB,
+        by_app * SlotMiB, (last_60s - by_app) * SlotMiB, read, (unsigned long long)oldest_ms, (unsigned long long)total);
+    if (length > 0) Report(line);
+    // The largest writers and ranges of that minute.
+    for (unsigned pick = 0; pick < 6; ++pick) {
+        const auto* const top = std::max_element(by_site, by_site + WriterSites + 1);
+        if (*top == 0) break;
+        const auto site = static_cast<std::size_t>(top - by_site);
+        length = std::snprintf(line, sizeof(line), "EDEN_GUEST_GROWTH_WRITER %zuMiB:", *top * SlotMiB);
+        if (site == WriterSites) {
+            length += std::snprintf(line + length, sizeof(line) - length, " no place left in the table");
+        } else {
+            for (const std::uintptr_t pc : writer_sites[site].pcs)
+                length += std::snprintf(line + length, sizeof(line) - length, " %llx",
+                                        (unsigned long long)(pc != 0 ? pc - 0x400000ull : 0));
+        }
+        std::snprintf(line + length, sizeof(line) - length, "\n");
+        Report(line);
+        by_site[site] = 0;
+    }
+    for (unsigned pick = 0; pick < 6; ++pick) {
+        const auto* const top = std::max_element(by_range, by_range + Ranges);
+        if (*top == 0) break;
+        const auto at = static_cast<std::size_t>(top - by_range);
+        std::snprintf(line, sizeof(line), "EDEN_GUEST_GROWTH_RANGE backing at 0x%llx: %zuMiB of its %zuMiB\n",
+                      (unsigned long long)at * RangeSlots * SparseSlot, *top * SlotMiB, RangeSlots * SlotMiB);
+        Report(line);
+        by_range[at] = 0;
+    }
+}
+
+namespace {
 // What finer slots would give: 16 KiB pages of the Own slots that hold only zeroes, and those that
 // repeat another page (by a full hash). Read once, when the session ends.
 void MeasureFinePages(SparseRange& range) noexcept {
@@ -1174,6 +1286,11 @@ void ReleaseServiceBlocks(SparseRange& range) noexcept {
 #endif
 }
 } // namespace
+
+// The report now, for a burst of writes that falls between two of the scanner's (headless/performance.cpp).
+extern "C" void eden_guest_memory_report(void) noexcept {
+    if (SparseRange* const range = service_range.load(std::memory_order_acquire)) ServiceReport(*range, "burst");
+}
 
 // ---- What the guest's kernel tells the service ----
 

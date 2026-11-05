@@ -390,6 +390,7 @@ extern "C" void eden_heap_sites_report(void) __attribute__((weak));
 extern "C" void eden_heap_usage(std::size_t* held, std::size_t* in_use, std::size_t* returned) __attribute__((weak));
 extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
 extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target) __attribute__((weak));
+extern "C" void eden_guest_memory_report(void) __attribute__((weak));
 #ifdef PS5_NATIVE
 extern "C" std::int64_t sceKernelGetDirectMemorySize();
 extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*,
@@ -430,6 +431,14 @@ static void RefreshFreeMemory() {
                      largest >> 20, int(view.short_memory), guest_held >> 20,
                      kernel_memory ? kernel_memory() >> 20 : 0ULL);
         ReportHeap("every 20 s");
+    }
+    // The last burst of a session falls between two reports of the guest's memory (every 30 s):
+    // who wrote it, while the pool's largest block is nearly gone (every 5 s at most).
+    static std::atomic<long long> burst_ns{0};
+    if (known && largest < (std::size_t{256} << 20) && eden_guest_memory_report &&
+        now - burst_ns.load(std::memory_order_relaxed) >= 5'000'000'000) {
+        burst_ns.store(now, std::memory_order_relaxed);
+        eden_guest_memory_report();
     }
     // The heap's empty spaces go back to the pool while it is short (every 2 s at most).
     static std::atomic<long long> trimmed_ns{0};
@@ -494,6 +503,73 @@ std::size_t TrimHeap(const char* why) {
         ReportHeap(text);
     }
     return returned;
+}
+
+// Refusals come in bursts, and a refused staging buffer is asked for twice: the first 32 reports at
+// most ten a second, then one every 5 s, so the last moments of a long session are still reported.
+bool RefusalReportDue() {
+    static std::atomic<unsigned> reports{0};
+    static std::atomic<long long> last_ns{0};
+    const long long now = NowNs();
+    const long long last = last_ns.load(std::memory_order_relaxed);
+    const long long gap = reports.load(std::memory_order_relaxed) < 32 ? 100'000'000 : 5'000'000'000;
+    if (last != 0 && now - last < gap) return false;
+    last_ns.store(now, std::memory_order_relaxed);
+    reports.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+extern "C" void eden_guest_memory_growth(void) __attribute__((weak));
+void ReportPool() {
+#ifdef PS5_NATIVE
+    // All that is free: the largest block of a range, then of what lies on each side of it. This
+    // needs only the call a release build already makes: sceKernelDirectMemoryQuery is used by
+    // ReportGpuThread alone, which only a profile build calls, so a release build does not import it.
+    const std::int64_t total = sceKernelGetDirectMemorySize();
+    struct Range { std::int64_t from, to; };
+    std::array<Range, 64> ranges;
+    std::size_t pending = 0;
+    if (total > 0) ranges[pending++] = {0, total};
+    std::size_t free_bytes = 0, largest = 0, from_2_mib = 0, from_16_mib = 0;
+    unsigned blocks = 0, asked = 0;
+    bool cut_short = false;
+    while (pending != 0) {
+        const Range range = ranges[--pending];
+        if (asked == 4096 || pending + 2 > ranges.size()) {
+            cut_short = true;
+            break;
+        }
+        ++asked;
+        std::int64_t start = 0;
+        std::size_t size = 0;
+        if (sceKernelAvailableDirectMemorySize(range.from, range.to, 0x4000, &start, &size) != 0 || size == 0) continue;
+        // Whether the kernel clips the block to the range is not documented here: keep it inside.
+        const std::int64_t end = std::min(start + static_cast<std::int64_t>(size), range.to);
+        start = std::max(start, range.from);
+        if (end <= start) continue;
+        size = static_cast<std::size_t>(end - start);
+        ++blocks;
+        free_bytes += size;
+        largest = std::max(largest, size);
+        if (size >= (std::size_t{2} << 20)) from_2_mib += size;
+        if (size >= (std::size_t{16} << 20)) from_16_mib += size;
+        // The smaller side is looked at first, which keeps the list short however the blocks lie.
+        Range first{range.from, start}, second{end, range.to};
+        if (first.to - first.from < second.to - second.from) std::swap(first, second);
+        if (first.to - first.from >= 0x4000) ranges[pending++] = first;
+        if (second.to - second.from >= 0x4000) ranges[pending++] = second;
+    }
+    std::size_t held = 0, target = 0;
+    if (eden_guest_memory_reserve) eden_guest_memory_reserve(&held, &target);
+    const auto kernel_memory = guest_kernel_memory.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "EDEN_REFUSED_POOL %lld MiB in all, %s%zu MiB free in %u blocks after %u questions: the largest "
+                 "%zu MiB, %zu MiB in blocks of 2 MiB or more, %zu MiB of 16 MiB or more; the guest's reserve holds %zu of "
+                 "%zu MiB, %u writes wait for a block; the kernel maps %llu MiB\n",
+                 static_cast<long long>(total >> 20), cut_short ? "at least " : "", free_bytes >> 20, blocks, asked,
+                 largest >> 20, from_2_mib >> 20, from_16_mib >> 20, held >> 20, target >> 20,
+                 eden_guest_memory_wanted ? eden_guest_memory_wanted() : 0u, kernel_memory ? kernel_memory() >> 20 : 0ULL);
+#endif
+    if (eden_guest_memory_growth) eden_guest_memory_growth();
 }
 
 extern "C" void eden_vma_probe(unsigned) __attribute__((weak));
