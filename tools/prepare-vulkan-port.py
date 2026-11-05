@@ -513,7 +513,7 @@ ALLOCATOR_REFUSED = """    VkResult created = CALL;
                          static_cast<unsigned long long>(guest_held >> 20),
                          static_cast<unsigned long long>(eden_heap_committed() >> 20));
             ::Eden::Performance::ReportHeap("a buffer was refused");
-            if (ReleaseRefused("a buffer was refused") != 0) {
+            if (ReleaseRefused("a buffer was refused", ci.size) != 0) {
                 created = AGAIN;
                 std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY asked once more: result %d, DETAIL\\n", int(created), VALUES);
             }
@@ -541,7 +541,7 @@ adapt('src/video_core/vulkan_common/vulkan_memory_allocator.h',
      '        using RefusalHook = u64 (*)(void* context, bool release);\n'
      '        void SetRefusalHook(RefusalHook hook, void* context) noexcept;'),
     ('        static bool IsAutoUsage(VmaMemoryUsage u) noexcept {',
-     '        u64 ReleaseRefused(const char* why) const;\n'
+     '        u64 ReleaseRefused(const char* why, u64 wanted) const;\n'
      '        void ReportRefused() const;\n'
      '        bool NoFallbackLeft(const VkImageCreateInfo& ci) const;\n\n'
      '        static bool IsAutoUsage(VmaMemoryUsage u) noexcept {'),
@@ -605,13 +605,21 @@ void MemoryAllocator::SetRefusalHook(RefusalHook hook, void* context) noexcept {
     refusal_hook.store(hook, std::memory_order_release);
 }
 
-u64 MemoryAllocator::ReleaseRefused(const char* why) const {
+u64 MemoryAllocator::ReleaseRefused(const char* why, u64 wanted) const {
     const auto hook = refusal_hook.load(std::memory_order_acquire);
     const u64 staging = hook ? hook(refusal_context, true) : 0;
     const u64 heap = ::Eden::Performance::TrimHeap(why);
-    std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY %s: %llu MiB of finished staging and %llu MiB of the heap went back\\n",
-                 why, static_cast<unsigned long long>(staging >> 20), static_cast<unsigned long long>(heap >> 20));
-    return staging + heap;
+    // Nothing the caches hold gets a session past this moment: an image the collector deletes keeps
+    // its memory until the next frame at the earliest. The guest's reserve is memory the pool can have
+    // at once, down to its floor. A buffer only (wanted 0: an image, which has its fallback), up to
+    // twice the request, at most 256 MiB.
+    const u64 lend = (std::min)((std::max)(wanted * 2, u64{32} << 20), u64{256} << 20);
+    const u64 lent = wanted != 0 && staging + heap < wanted && eden_guest_reserve_lend ? eden_guest_reserve_lend(lend) : 0;
+    std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY %s: %llu MiB of finished staging, %llu MiB of the heap and %llu MiB of the "
+                 "guest's reserve went back\\n",
+                 why, static_cast<unsigned long long>(staging >> 20), static_cast<unsigned long long>(heap >> 20),
+                 static_cast<unsigned long long>(lent >> 20));
+    return staging + heap + lent;
 }
 
 // What held the pool when it refused: the pool, the guest's memory, the allocator's blocks by memory
@@ -662,7 +670,7 @@ bool MemoryAllocator::NoFallbackLeft(const VkImageCreateInfo& ci) const {
     return ends;
 }'''),
     ('#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n',
-     '#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n#include <atomic>\n#include <cstddef>\n#include <cstdio>\n#include <cstring>\n#include <cstdlib>\n#include "performance.h"\nnamespace Common { void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept; }\nextern "C" std::size_t eden_heap_committed(void);\n'),
+     '#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n#include <atomic>\n#include <cstddef>\n#include <cstdio>\n#include <cstring>\n#include <cstdlib>\n#include "performance.h"\nnamespace Common { void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept; }\nextern "C" std::size_t eden_heap_committed(void);\nextern "C" std::size_t eden_guest_reserve_lend(std::size_t) __attribute__((weak));\n'),
     # An image the pool could not hold would be made with nothing bound: reads give zero, writes are
     # lost, and Eden's comment above says AMD's drivers do not survive sampling one. So it gets what a
     # buffer gets, and only then the fallback. The fallback stays: now and then an image too big for
@@ -674,7 +682,7 @@ bool MemoryAllocator::NoFallbackLeft(const VkImageCreateInfo& ci) const {
     ('    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D) {\n',
      '''    bool no_fallback = false;
     if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && !huge) {
-        if (ReleaseRefused("an image was refused") != 0) {
+        if (ReleaseRefused("an image was refused", 0) != 0) {
             VmaAllocationCreateInfo once_more = alloc_ci;
             once_more.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
             result = vmaCreateImage(allocator, &ci, &once_more, &handle, &allocation, &alloc_info);
@@ -853,9 +861,15 @@ adapt('src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp', 'vulkan_stagi
      '                released += ::Eden::StagingBuffers::ReleaseFrom(level, idle);\n'
      '            }\n'
      '        }\n'
-     '        std::fprintf(stderr, "EDEN_STAGING_OOM asked=%zu made=%llu released=%zu buffers (%llu MiB)\\n", size,\n'
-     '                     static_cast<unsigned long long>(made), released.buffers,\n'
+     '        std::fprintf(stderr, "EDEN_STAGING_OOM asked=%zu made=%llu usage=%d deferred=%d released=%zu buffers (%llu MiB)\\n",\n'
+     '                     size, static_cast<unsigned long long>(made), int(usage), int(deferred), released.buffers,\n'
      '                     static_cast<unsigned long long>(released.bytes >> 20));\n'
+     '        // Eight MiB and a page took 16 MiB, and the pool had 13 in one piece. Only what the CPU maps:\n'
+     '        // Holds() knows the size of those; a kept buffer of the others is taken to be its power of two.\n'
+     '        // In steps of 2 MiB, what a mapping takes anyway: less would only leave dust in the pool.\n'
+     '        if (usage != MemoryUsage::DeviceLocal) {\n'
+     '            buffer_ci.size = (std::min<VkDeviceSize>)(made, Common::AlignUp(VkDeviceSize(size), VkDeviceSize{2} << 20));\n'
+     '        }\n'
      '        buffer = memory_allocator.CreateBuffer(buffer_ci, usage);\n'
      '    }\n'
      '    // A large buffer smaller than the power of two: the 1st, 2nd, 4th, 8th ... in the log.\n'
@@ -1155,6 +1169,17 @@ for old, new in [
     (cleanup_capture,
      gc_setup + '\n    const auto Cleanup = [&, this]'),
     ('        if (must_download) {', '        if (must_download && !TakePrefetched(image_id, image)) {'),
+    # A refused staging buffer leaves the image where it is: it is not deleted, nothing is lost.
+    ('            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);\n',
+     '            auto staged = [&] {\n'
+     '                if constexpr (std::is_same_v<Runtime, Vulkan::TextureCacheRuntime>) {\n'
+     '                    return runtime.TryDownloadStagingBuffer(image.unswizzled_size_bytes);\n'
+     '                } else {\n'
+     '                    return std::optional{runtime.DownloadStagingBuffer(image.unswizzled_size_bytes)};\n'
+     '                }\n'
+     '            }();\n'
+     '            if (!staged) {\n                return false;\n            }\n'
+     '            auto& map = *staged;\n'),
     # Time the per-image drain Cleanup still takes for an image the prefetch could not batch.
     # One GPU pipeline wait per eviction, against one wait for a whole batch in the batched path:
     # this is the stall the prefetch exists to remove, so keep it visible.
@@ -1167,7 +1192,11 @@ for old, new in [
      '                runtime.Finish();\n'
      '            }\n'
      '            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span, swizzle_data_buffer);'),
-    ('(!high_priority_mode && must_download)) {', '(!DirtyEvictions() && must_download)) {'),
+    # Copying a dirty image out needs a staging buffer and a scratch buffer of its size, and its bytes
+    # then land in guest memory: on a pool the CPU shares, evicting a large one takes more than it gives
+    # (Ocarina of Time's 288 MiB depth image: 576 MiB more at that moment, 288 MiB for good).
+    ('(!high_priority_mode && must_download)) {',
+     '(!DirtyEvictions() && must_download) ||\n            (must_download && image.unswizzled_size_bytes >= 128_MiB)) {'),
     ('    Configure(false);', '    Configure(false);\n    PrefetchDownloads();'),
     ('        Configure(true);', '        Configure(true);\n        PrefetchDownloads();'),
 ]:

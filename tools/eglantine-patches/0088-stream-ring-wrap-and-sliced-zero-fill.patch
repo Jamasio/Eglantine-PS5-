@@ -1,0 +1,64 @@
+stream ring: look at its start before going back; sliced zero fill transitions first
+
+Two faults in 0069, both found by reading, neither seen on the console.
+
+GetStreamBuffer reset its iterators before it checked that the start of the ring was free. When
+the start was busy that request went to a staging buffer, but the next request's check then
+covered no region and it was handed offset 0 while the GPU could still be reading there. The
+logic is Eden's, but 8 MiB slices of large images wrap the 128 MiB ring far more often than
+uniforms do, and a wrong layer or wrong uniforms would be the result. The check now comes first,
+and a busy start changes nothing.
+
+UploadMemory marks an image initialized at its first call and each call's barrier covers only its
+slice, so every slice of the zero fill after the first claimed GENERAL on layers still UNDEFINED.
+The image now goes to GENERAL as a whole before the first slice.
+
+diff --git a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+index e8db3c1..7c86ae9 100644
+--- a/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
++++ b/src/video_core/renderer_vulkan/vk_staging_buffer_pool.cpp
+@@ -151,19 +151,24 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
+     std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + Region(iterator),
+               current_tick);
+     used_iterator = iterator;
+-    free_iterator = (std::max)(free_iterator, iterator + size);
+ 
+     if (iterator + size >= stream_buffer_size) {
++        // The start of the ring is looked at before going back to it. It used to be looked at
++        // after: with the start busy this request went to a staging buffer, the iterators stayed
++        // at the start, and the next request's check covered no region, so it got offset 0 while
++        // the GPU could still be reading there. Slices of large images wrap the ring far more
++        // often than uniforms did.
++        if (AreRegionsActive(0, Region(size) + 1)) {
++            // Avoid waiting for the previous usages to be free
++            return GetStagingBuffer(size, MemoryUsage::Upload);
++        }
+         std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + NUM_SYNCS,
+                   current_tick);
+         used_iterator = 0;
+         iterator = 0;
+         free_iterator = size;
+-
+-        if (AreRegionsActive(0, Region(size) + 1)) {
+-            // Avoid waiting for the previous usages to be free
+-            return GetStagingBuffer(size, MemoryUsage::Upload);
+-        }
++    } else {
++        free_iterator = (std::max)(free_iterator, iterator + size);
+     }
+     const size_t offset = iterator;
+     iterator = Common::AlignUp(iterator + size, MAX_ALIGNMENT);
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index b2a475e..bc8cc9b 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -2449,6 +2449,9 @@ void TextureCache<P>::QueueAsyncDecode(Image& image, ImageId image_id) {
+                 zero_bytes = (std::max)(zero_bytes, copy.buffer_size /
+                                         static_cast<size_t>(copy.image_subresource.num_layers));
+             }
++            // UploadMemory marks the image initialized at its first call, and each call's barrier
++            // covers its slice: every later slice would claim GENERAL on layers still UNDEFINED.
++            runtime.TransitionImageLayout(image);
+             auto staging = runtime.UploadStagingBuffer(zero_bytes);
+             std::memset(staging.mapped_span.data(), 0, zero_bytes);
+             size_t next_copy = 0;

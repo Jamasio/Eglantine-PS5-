@@ -96,6 +96,18 @@ std::uintptr_t SlotAddress(SparseRange& range, std::size_t slot) noexcept {
 // (ReserveKeeper) and given back with the guest's memory when the session ends.
 constexpr std::size_t ReserveBlocks = 256;      // 512 MiB (diagnostic62 shared-pool test)
 constexpr std::size_t ReserveAtStart = 16;      // taken as the service starts; the keeper takes the rest
+// The pool's largest block is under 1 GiB (headless/performance.cpp, every 100 ms). The reserve was
+// only for when the pool says no, and that moment never came: the graphics allocations ran out first,
+// with 512 MiB idle here (run 38, run 39: reserve=512, reserve_used=0) while the game's writes went
+// on cutting 2 MiB blocks out of what was left for them. So while the pool is short the writes live
+// off the reserve down to a floor, a refused buffer can have what is left above it (lend, below), and
+// the keeper fills it no further than the floor. The floor is one for both, so the saving is one: at
+// most the reserve less the floor. 128 blocks (256 MiB) until guest growth has been measured with it:
+// a write that finds no block waits 2 s and then ends the session, and a host write that does (a
+// fence's download holds the buffer cache's lock) stops the thread the collector runs on.
+// EDEN_GUEST_RESERVE_FLOOR=<blocks>; 256 keeps the reserve as it was.
+std::atomic<bool> pool_is_short{false};
+std::atomic<std::size_t> reserve_floor{128};
 std::int64_t reserve[ReserveBlocks];
 std::atomic<std::size_t> reserve_count{0};
 std::atomic_flag reserve_lock = ATOMIC_FLAG_INIT;
@@ -121,6 +133,12 @@ bool ReserveBlock(std::int64_t* physical) noexcept {
     reserve_lock.clear(std::memory_order_release);
     if (ok) counters.reserve_used.fetch_add(1, std::memory_order_relaxed);
     return ok;
+}
+// A zeroed block from the reserve first, while the pool is short.
+bool SparedBlock(std::int64_t* physical) noexcept {
+    return pool_is_short.load(std::memory_order_relaxed) &&
+           reserve_count.load(std::memory_order_relaxed) > reserve_floor.load(std::memory_order_relaxed) &&
+           ReserveBlock(physical);
 }
 // Zeroed blocks into the reserve until it holds `blocks` (at most ReserveBlocks) or the pool says no.
 void FillReserve(std::size_t blocks = ReserveBlocks) noexcept {
@@ -193,7 +211,7 @@ bool PromoteZero(SparseRange& range, std::size_t slot) noexcept {
     const std::uintptr_t at = SlotAddress(range, slot);
 #ifdef PS5_NATIVE
     std::int64_t physical = -1;
-    if (!ZeroedBlock(&physical) && !ReserveBlock(&physical)) return false;
+    if (!SparedBlock(&physical) && !ZeroedBlock(&physical) && !ReserveBlock(&physical)) return false;
     if (!MapSlot(at, PROT_READ | PROT_WRITE, physical)) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
         return false;
@@ -310,7 +328,9 @@ bool PromoteFine(SparseRange& range, std::size_t slot) noexcept {
     const std::size_t kept = FineKept(range, slot);
 #ifdef PS5_NATIVE
     std::int64_t physical = -1;
-    if (eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 && !ReserveBlock(&physical)) return false;
+    if (!SparedBlock(&physical) && eden_direct_low(SparseSlot, SparseSlot, 12, &physical) != 0 &&
+        !ReserveBlock(&physical))
+        return false;
     void* view = reinterpret_cast<void*>(cpu_mapping_hint);
     if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, physical, SparseSlot) != 0) {
         (void)sceKernelReleaseDirectMemory(physical, SparseSlot);
@@ -563,6 +583,38 @@ bool TakeHostReserveBlock(std::int64_t* physical) noexcept {
 #endif
 }
 
+// A graphics buffer was refused with nothing else left to give, which ends the session: blocks of the
+// reserve go back to the pool, the newest first, down to the floor. Buffers only: an image has its
+// fallback, and it can ask for more than this could ever give. Not while a guest write waits for a
+// block. The keeper leaves them alone while the pool is short. What went back, in bytes.
+extern "C" std::size_t eden_guest_reserve_lend(std::size_t bytes) noexcept {
+#ifdef PS5_NATIVE
+    if (service_range.load(std::memory_order_acquire) == nullptr ||
+        memory_waiters.load(std::memory_order_acquire) != 0) return 0;
+    const std::size_t floor = reserve_floor.load(std::memory_order_relaxed);
+    std::size_t lent = 0, adjacent = 0;
+    Spin(reserve_lock);
+    std::size_t count = reserve_count.load(std::memory_order_relaxed);
+    while (lent < bytes && count > floor) {
+        const std::int64_t block = reserve[count - 1];
+        if (sceKernelReleaseDirectMemory(block, SparseSlot) != 0) break;
+        if (count >= 2 && reserve[count - 2] + static_cast<std::int64_t>(SparseSlot) == block) ++adjacent;
+        --count;
+        lent += SparseSlot;
+    }
+    reserve_count.store(count, std::memory_order_relaxed);
+    reserve_lock.clear(std::memory_order_release);
+    // Single 2 MiB blocks serve a buffer through the driver's pieces (Mesa f5610fe27) or, next to each
+    // other, in one range: how many were, for the log.
+    std::fprintf(stderr, "EDEN_RESERVE_LENT %zu MiB, %zu of %zu blocks beside the next; %zu blocks left\n", lent >> 20,
+                 adjacent, lent / SparseSlot, count);
+    return lent;
+#else
+    (void)bytes;
+    return 0;
+#endif
+}
+
 // The guest's headroom (the reserve): what it holds and what it is to hold, in bytes; both 0 while
 // the service does not run or keeps no reserve (the host). headless/performance.cpp counts what is
 // not held yet as taken, as all of it was before.
@@ -570,11 +622,20 @@ extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target
 #ifdef PS5_NATIVE
     const bool running = service_range.load(std::memory_order_acquire) != nullptr;
     *held = running ? reserve_count.load(std::memory_order_relaxed) * SparseSlot : 0;
-    *target = running ? ReserveBlocks * SparseSlot : 0;
+    // Spent on purpose while the pool is short, so not counted as taken from what the caches see
+    // (performance.h ViewOfPool): they would read a free pool as full for most of a session.
+    const std::size_t blocks =
+        pool_is_short.load(std::memory_order_relaxed) ? reserve_floor.load(std::memory_order_relaxed) : ReserveBlocks;
+    *target = running ? blocks * SparseSlot : 0;
 #else
     *held = 0;
     *target = 0;
 #endif
+}
+
+// Whether the pool's largest block is short (headless/performance.cpp, RefreshFreeMemory).
+extern "C" void eden_guest_memory_pool_short(int is_short) noexcept {
+    pool_is_short.store(is_short != 0, std::memory_order_relaxed);
 }
 
 // How the waits ended so far, and the writes refused for want of a block (headless/performance.cpp
@@ -736,7 +797,8 @@ void ReserveKeeper() {
         scanner_wake.wait_for(lock, std::chrono::milliseconds(100), [] { return scanner_stop; });
         if (scanner_stop) break;
         lock.unlock();
-        FillReserve();
+        FillReserve(pool_is_short.load(std::memory_order_relaxed) ? reserve_floor.load(std::memory_order_relaxed)
+                                                                  : ReserveBlocks);
         lock.lock();
     }
 }
@@ -1218,6 +1280,9 @@ void ServiceStart(SparseRange& range) noexcept {
     ResetCounters();
     range.promote = true;
 #ifdef PS5_NATIVE
+    if (const char* floor = std::getenv("EDEN_GUEST_RESERVE_FLOOR"))
+        reserve_floor.store(std::min<std::size_t>(std::strtoul(floor, nullptr, 10), ReserveBlocks),
+                            std::memory_order_relaxed);
     FillReserve(ReserveAtStart);
 #endif
     service_range.store(&range, std::memory_order_release);

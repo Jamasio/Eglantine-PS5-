@@ -391,6 +391,7 @@ extern "C" void eden_heap_usage(std::size_t* held, std::size_t* in_use, std::siz
 extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
 extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target) __attribute__((weak));
 extern "C" void eden_guest_memory_report(void) __attribute__((weak));
+extern "C" void eden_guest_memory_pool_short(int is_short) __attribute__((weak));
 #ifdef PS5_NATIVE
 extern "C" std::int64_t sceKernelGetDirectMemorySize();
 extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*,
@@ -417,6 +418,14 @@ static void RefreshFreeMemory() {
     std::size_t held = 0, target = 0;
     if (eden_guest_memory_reserve) eden_guest_memory_reserve(&held, &target);
     const PoolView view = ViewOfPool(known, largest, held, target);
+    // The pool itself, not view.short_memory: that turns true when the reserve is down to half, and
+    // would keep the keeper from ever filling it again. Short under 1 GiB and over only at 1.5 GiB:
+    // filling the reserve takes up to 512 MiB, and the largest block must not fall under the mark again.
+    static std::atomic<bool> pool_short{false};
+    if (known) pool_short.store(largest < kShortMemory ||
+                                (pool_short.load(std::memory_order_relaxed) && largest < kShortMemory + kShortMemory / 2),
+                                std::memory_order_relaxed);
+    if (eden_guest_memory_pool_short) eden_guest_memory_pool_short(pool_short.load(std::memory_order_relaxed));
     largest_free_block.store(known ? (view.free != 0 ? view.free : 1) : 0, std::memory_order_relaxed);
     graphics_memory_short.store(view.short_memory, std::memory_order_relaxed);
     // The pool, the guest's memory and the heap in stderr.log every 20 s, to see what holds it.

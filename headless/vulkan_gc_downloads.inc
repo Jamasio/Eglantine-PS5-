@@ -72,7 +72,10 @@
                 if (!image.aliased_images.empty() || !image.overlapping_images.empty() ||
                     image.info.num_samples != 1 || gc_downloads.size() == kBatchImages)
                     return true;
-                auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
+                // No staging buffer: the images left stay for now, and Cleanup leaves them too.
+                const auto staged = runtime.TryDownloadStagingBuffer(image.unswizzled_size_bytes, true);
+                if (!staged) return true;
+                auto map = *staged;
                 // Pin until CPU publication, even if later recording submits work.
                 gc_downloads.emplace_back(id, map);
                 const auto copies = FullDownloadCopies(image.info);
