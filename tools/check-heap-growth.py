@@ -14,9 +14,7 @@ that hold nothing are given back (eden_heap_trim) while six threads take and fre
 spaces, a given-back piece being unreadable until it is committed again, and the heap's range is
 filled again after a trim; a large block takes memory in pieces when no one piece is free. Empty
 arenas go back to their spaces when their thread ends and when the heap is trimmed, while other
-threads take and free small blocks, and stay with EDEN_HEAP_KEEP_ARENAS set. An arena or a space
-given back is destroyed first (the stand-in's sceLibcMspaceDestroy spoils it, so a request to it
-afterwards asserts).
+threads take and free small blocks, and stay with EDEN_HEAP_KEEP_ARENAS set.
 """
 import pathlib
 import subprocess
@@ -128,16 +126,6 @@ static void *take(struct space *space, size_t size) {
     return result;
 }
 void *sceLibcMspaceMalloc(void *space, size_t size) { return take(space, size); }
-// A destroyed space is no space: its magic goes, so a request to it afterwards asserts. Weak, as
-// the heap imports it (the console's SDK may lack it).
-int sceLibcMspaceDestroy(void *handle) __attribute__((weak));
-int sceLibcMspaceDestroy(void *handle) {
-    struct space *space = handle;
-    assert(space->magic == 0x5bace5bace5bace5ull);
-    space->magic = 0;
-    pthread_mutex_destroy(&space->lock);
-    return 0;
-}
 void *sceLibcMspaceCalloc(void *space, size_t count, size_t size) {
     void *address = take(space, count * size);
     return address ? memset(address, 0, count * size) : NULL;

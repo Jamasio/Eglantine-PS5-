@@ -87,16 +87,6 @@
  * this (a block kept in a thread's cache is one); the paths that read the list of arenas or a
  * record's arenas (a thread out of room, the reports) now run under the creation lock, the lock
  * an arena is given back under. EDEN_HEAP_KEEP_ARENAS in the environment turns this off.
- *
- * An mspace is destroyed before its memory moves on. The console's libc keeps every mspace it
- * made (sceLibcMspaceCreate takes a name for the debugger's heap view, and sceLibcMspaceDestroy
- * takes one out); an arena's or a space's memory handed on with its mspace still known to libc is
- * memory libc may write into when the next mspace is made or looked at. Run 54 (ocarina-next14)
- * gave back 81 arenas and three pieces in one trim, made 86 arenas in the next seconds, and ended
- * with junk in the GPU's command stream; with EDEN_HEAP_KEEP_ARENAS run 55 did not. So an empty
- * arena is destroyed before it goes back to its space, and a space before its memory goes back
- * to the system (both paths first ran on the console in run 54). Where the SDK has no
- * sceLibcMspaceDestroy (a weak import), nothing is destroyed and the kernel log says so once.
  */
 #include <pthread.h>
 #include <stdio.h>
@@ -214,19 +204,6 @@ static atomic_uint eden_heap_large_count;
 static atomic_size_t eden_heap_large_bytes;
 
 int sceKernelUsleep(unsigned int microseconds);
-int sceLibcMspaceDestroy(void *mspace) __attribute__((weak));
-int sceKernelDebugOutText(int channel, const char *text);
-
-/* Takes an mspace out of libc's books before its memory is used for anything else. */
-static void eden_heap_destroy_mspace(void *mspace) {
-  if (sceLibcMspaceDestroy != NULL) {
-    sceLibcMspaceDestroy(mspace);
-    return;
-  }
-  static atomic_int reported;
-  if (atomic_fetch_add_explicit(&reported, 1, memory_order_relaxed) == 0)
-    sceKernelDebugOutText(0, "EDEN_HEAP sceLibcMspaceDestroy is not in this SDK: mspaces given back stay known to libc\n");
-}
 
 /* Arena creation is rare (once per thread) but runs under a spin flag, and its holder also takes
  * an mspace lock. The emulated cores and the GPU thread run at real-time priority pinned to
@@ -615,6 +592,8 @@ static void *eden_heap_space_try(void *space, int kind, size_t a, size_t b) {
   return sceLibcMspacePosixMemalign(space, &address, a, b) == 0 ? address : NULL;
 }
 
+int sceKernelDebugOutText(int channel, const char *text);
+
 /* Why the heap could not grow, for the kernel log: the allocation that asked is about to fail.
  * No stdio here (it allocates), and only the first few times. */
 static void eden_heap_grow_refused(const char *line) {
@@ -809,20 +788,9 @@ size_t eden_heap_trim(void) {
     }
     const unsigned first = eden_heap_space_first[slot], span = eden_heap_space_span[slot];
     const size_t size = (size_t)span << EDEN_HEAP_PIECE_SHIFT;
-    void *const start = (char *)ps5_heap_base + ((size_t)first << EDEN_HEAP_PIECE_SHIFT);
-    /* Nothing can reach the space now (retired, no user, no block): out of libc's books before its
-     * memory goes. A space kept after all (heap_return=off) is made again over the same memory. */
-    void *const space = atomic_load_explicit(&eden_heap_spaces[slot], memory_order_acquire);
-    eden_heap_destroy_mspace(space);
-    const int done = eden_heap_decommit(start, size);
+    const int done = eden_heap_decommit((char *)ps5_heap_base + ((size_t)first << EDEN_HEAP_PIECE_SHIFT), size);
     if (done == 0) {
       /* Kept as it was (dev-settings heap_return=off, or nothing to give back): usable again. */
-      void *again = sceLibcMspaceCreate("Eden-heap", start, size, 0);
-      if (again == NULL)
-        continue; /* retired for good: its memory stays, nothing uses it */
-      for (unsigned piece = first; piece < first + span; ++piece)
-        atomic_store_explicit(&eden_heap_piece_space[piece], again, memory_order_release);
-      atomic_store_explicit(&eden_heap_spaces[slot], again, memory_order_release);
       atomic_store_explicit(&eden_heap_space_retired[slot], 0, memory_order_seq_cst);
       continue;
     }
@@ -975,10 +943,8 @@ static void eden_heap_return_record(struct eden_heap_thread *record, int ended) 
       continue;
     }
     /* No block is in it and no thread is on it: nothing can take from it or free into it now.
-     * Out of the slot's and the list's tables first, then out of libc's, then its memory to its
-     * space. */
+     * Out of the slot's and the list's tables first, then its memory to its space. */
     atomic_store_explicit(&eden_heap_slots[eden_heap_slot(block)], NULL, memory_order_release);
-    eden_heap_destroy_mspace(arena);
     eden_heap_arena_list[index] = NULL;
     atomic_store_explicit(&eden_heap_arena_blocks_probe[index], NULL, memory_order_relaxed);
     atomic_fetch_add_explicit(&eden_heap_arena_holes, 1, memory_order_relaxed);

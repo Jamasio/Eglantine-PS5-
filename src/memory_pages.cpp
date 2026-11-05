@@ -34,15 +34,6 @@
 // Keep CPU heaps/tables and JIT views out of RADV's high-word-2 GPU window.
 // This is a non-fixed hint: the kernel retains ownership of collision handling.
 constexpr std::uintptr_t cpu_mapping_hint = 0x1000000000ull;
-// Where the heap's range goes (ReserveMemoryRange): above everything that asks for an address
-// from cpu_mapping_hint, which the kernel places in the first gap at or after the hint. The heap's
-// range was reserved from that hint too, as the first thing the app reserves, and the gap a piece
-// given back leaves (DecommitMemoryRange: unmapped, then reserved again) was then the first gap
-// of all: a zeroed block's view (ZeroedBlock, every guest write that needs one), a large block of
-// the heap, a code cache, could land in it between the two calls, and the reservation that
-// followed, MAP_FIXED, took its mapping away. 32 GiB higher, the heap's gaps come after every gap
-// below them. EDEN_HEAP_RANGE_LOW=1 in the environment keeps the old place.
-constexpr std::uintptr_t heap_range_hint = 0x1800000000ull;
 // Where the guest's own memory is mapped: above every address a guest can have (2^39, the end of
 // the 39-bit address space of a 64-bit title). A guest page table entry is the page's host
 // address less its guest address, and zero means "no pointer" (common/page_table.h). At the
@@ -709,7 +700,6 @@ void SparseUsage(std::size_t* reserved, std::size_t* committed) noexcept {
 // ---- A range that grows: the heap ----
 //
 void* ReserveAddressRange(std::size_t size) noexcept;
-void* ReserveAddressRangeFrom(std::size_t size, std::uintptr_t hint) noexcept;
 bool CommitMemoryRangeFrom(void* address, std::size_t size, bool high) noexcept;
 int DecommitMemoryRange(void* address, std::size_t size) noexcept;
 
@@ -764,22 +754,15 @@ void* ReserveMemoryRange(std::size_t size) noexcept {
 #ifdef PS5_NATIVE
     // Development A/B: dev-settings heap=whole takes the heap's memory at start, as before.
     if (DevSetting("heap=whole")) return nullptr;
-    const char* const low = std::getenv("EDEN_HEAP_RANGE_LOW");
-    return ReserveAddressRangeFrom(size, low && low[0] == '1' ? cpu_mapping_hint : heap_range_hint);
-#else
-    return ReserveAddressRange(size);
 #endif
+    return ReserveAddressRange(size);
 }
 
 // Address space alone, whatever the heap's development switches say (the heap's large blocks).
 void* ReserveAddressRange(std::size_t size) noexcept {
-    return ReserveAddressRangeFrom(size, cpu_mapping_hint);
-}
-
-void* ReserveAddressRangeFrom(std::size_t size, [[maybe_unused]] std::uintptr_t hint) noexcept {
     if (size == 0 || size % LargePage != 0) return nullptr;
 #ifdef PS5_NATIVE
-    void* address = reinterpret_cast<void*>(hint);
+    void* address = reinterpret_cast<void*>(cpu_mapping_hint);
     if (sceKernelReserveVirtualRange(&address, size, 0, LargePage) != 0) return nullptr;
     if (!cpu_mapping_range(address, size)) {
         (void)munmap(address, size);
