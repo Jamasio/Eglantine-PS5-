@@ -1140,17 +1140,16 @@ int main(int argc, char** argv) {
             // every session at their exact values (above), so one that is not chosen is off.
             const auto speed = Eden::LoadPerformance(eden_game_title_id(guest));
 #ifdef PS5_NATIVE
-            // Donkey Kong Bananza and Ocarina of Time run short of memory: written slots with many
-            // pages of zeroes keep only the others (576 MiB of Bananza's 4.3 GiB were such pages),
-            // and a write makes one whole. Mario Kart World stays off while its GPU hang is looked
-            // for: Fine would change its timing. A value from env.txt wins, for any game
+            // Donkey Kong Bananza, Ocarina of Time and Mario Kart World run short of memory: written
+            // slots with many pages of zeroes keep only the others (576 MiB of Bananza's 4.3 GiB were
+            // such pages), and a write makes one whole. A value from env.txt wins, for any game
             // (EDEN_CRAM_FINE=0 or 1).
             {
                 const auto fine_title = eden_game_title_id(guest);
-                bool fine = fine_title == 0x040074A01BF12000ULL || fine_title == 0x0400486024DEC000ULL;
+                bool fine = fine_title == 0x040074A01BF12000ULL || fine_title == 0x0400486024DEC000ULL ||
+                            fine_title == 0x0400C3F00006E000ULL;
                 if (const char* chosen = std::getenv("EDEN_CRAM_FINE")) fine = chosen[0] != '0';
-                ::Common::SetGuestMemoryFine(fine ||
-                                         eden_game_title_id(guest) == 0x0400C3F00006E000ULL);
+                ::Common::SetGuestMemoryFine(fine);
             }
 #endif
             Settings::values.use_asynchronous_shaders = speed.async_shaders;
