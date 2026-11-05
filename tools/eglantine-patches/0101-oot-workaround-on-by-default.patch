@@ -1,0 +1,58 @@
+From: MythosOfs <98063411+MythosOfs@users.noreply.github.com>
+Subject: [PATCH] Ocarina of Time: workaround on by default
+
+Port of Orchid 5b5c31642 by MythosOfs. Default is now on for this title;
+EDEN_NX2_OOT_VISUAL_WORKAROUND=0 turns it off. Each edited shader logs
+"TEMPORARY OoT visual workaround: shader <hash>, <n> scalar edits"; 0 edits
+means the shader's shape differs and it was left alone.
+---
+ docs/OOT_VISUAL_WORKAROUND.md                        | 5 +++--
+ src/shader_recompiler/ir_opt/oot_visual_workaround.h | 2 +-
+ src/video_core/renderer_vulkan/vk_pipeline_cache.cpp | 3 ++-
+ 3 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/docs/OOT_VISUAL_WORKAROUND.md b/docs/OOT_VISUAL_WORKAROUND.md
+index 464847efe9..fda64e6a46 100644
+--- a/docs/OOT_VISUAL_WORKAROUND.md
++++ b/docs/OOT_VISUAL_WORKAROUND.md
+@@ -1,10 +1,11 @@
+ # Ocarina of Time visual workaround (temporary)
+ 
+-This is a temporary, opt-in visual workaround for The Legend of Zelda: Ocarina of Time
++This is a temporary visual workaround for The Legend of Zelda: Ocarina of Time
+ (`0400486024DEC000`). It is not an emulator fix. It edits two shaders of this game so the
+ outdoor haze and exposure look closer to the reference. The root cause of the haze is still open.
+ 
+-Set `EDEN_NX2_OOT_VISUAL_WORKAROUND=1` to enable it. Any other value, or no value, leaves it off.
++It is on by default for this title. Set `EDEN_NX2_OOT_VISUAL_WORKAROUND=0` to turn it
++off, for example for an A/B comparison.
+ Each edited shader logs `TEMPORARY OoT visual workaround: shader <hash>, <n> scalar edits` at
+ warning level. An edit count of 0 means the shader no longer has the expected shape and was left
+ unchanged.
+diff --git a/src/shader_recompiler/ir_opt/oot_visual_workaround.h b/src/shader_recompiler/ir_opt/oot_visual_workaround.h
+index cbcbab5aad..1bce69f415 100644
+--- a/src/shader_recompiler/ir_opt/oot_visual_workaround.h
++++ b/src/shader_recompiler/ir_opt/oot_visual_workaround.h
+@@ -11,7 +11,7 @@
+ 
+ namespace Shader::Optimization {
+ 
+-// TEMPORARY opt-in visual workaround for Ocarina of Time, not an emulator fix.
++// TEMPORARY visual workaround for Ocarina of Time, not an emulator fix.
+ inline std::optional<size_t> ApplyOotVisualWorkaround(IR::Program& program, u64 title_id,
+                                                      u64 shader_hash, bool enabled) {
+     if (!enabled || title_id != 0x0400486024DEC000ULL) {
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 5b008b20af..f32a73e37c 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -397,7 +397,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+                                 !DriverCachesPipelines(device_)},
+       oot_visual_workaround{[] {
+           const char* value = std::getenv("EDEN_NX2_OOT_VISUAL_WORKAROUND");
+-          return value != nullptr && std::string_view{value} == "1";
++          // On by default for Ocarina of Time; EDEN_NX2_OOT_VISUAL_WORKAROUND=0 turns it off.
++          return value == nullptr || std::string_view{value} != "0";
+       }()},
+       workers(device.HasBrokenParallelShaderCompiling() ? 1ULL : GetTotalPipelineWorkers(),
+               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),

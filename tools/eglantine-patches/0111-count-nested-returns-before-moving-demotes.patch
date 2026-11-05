@@ -1,0 +1,39 @@
+shader: count nested returns before moving demotes to the end
+
+Ported from zortos293/Lichii #127 (85d0363175, by Inc0rporate), still open
+there. The demote reorder only counted Epilogue blocks at branch depth 1 or
+less, so it missed a nested early return and moved the demote past it. Those
+invocations then wrote their unset colour.
+
+The pass runs only with needs_demote_reorder, which is AMD proprietary, AMDVLK
+and Samsung. RADV reports VK_DRIVER_ID_MESA_RADV and is not on that list, so
+this changes nothing on PS5. Kept to stay level with the source. No switch.
+
+diff --git a/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp b/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+index 50cff52..7a31d03 100644
+--- a/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
++++ b/src/shader_recompiler/frontend/maxwell/structured_control_flow.cpp
+@@ -904,16 +904,18 @@ private:
+             if (node.type != Type::Block) {
+                 continue;
+             }
+-            if (branch_depth > 1) {
+-                // Skip reordering nested demote branches.
+-                continue;
+-            }
+             for (const IR::Inst& inst : node.data.block->Instructions()) {
+                 const IR::Opcode op{inst.GetOpcode()};
+                 if (op == IR::Opcode::DemoteToHelperInvocation) {
+-                    demote_blocks.push_back(node.data.block);
++                    // Skip reordering nested demote branches.
++                    if (branch_depth <= 1) {
++                        demote_blocks.push_back(node.data.block);
++                    }
+                     break;
+                 }
++                // Returns count at any depth: a nested early return (an EXIT under two
++                // conditions, as native fragment programs end their discarded invocations) would
++                // otherwise leave before the demote moved to the end, and write its colours.
+                 if (op == IR::Opcode::Epilogue) {
+                     ++num_epilogues;
+                 }

@@ -529,10 +529,15 @@ int main(int argc, char** argv) {
         // pages with nothing to flush answer on the guest core instead of waiting for the GPU
         // thread, as they do with fastmem (Mario Kart World's title screen: 13 -> 20 FPS). The
         // three waits poll 300 us before sleeping: a wake-up here is a system call on both sides.
+        // Test build: the limit of refused images in 2 s is off. Refused uploads and downloads no
+        // longer end the session, and at the pace of runs 44 and 45 the limit would end it within
+        // a second instead, before showing what these patches do. env.txt EDEN_NX2_UNBACKED_LIMIT=8
+        // brings it back. "limit 0" in stderr shows this took effect.
         for (const auto& [name, value] : {std::pair{"EDEN_NX2_UNSAFE_PREEMPTIVE_READS", "1"},
                                           std::pair{"EDEN_PS5_READ_SPIN_US", "300"},
                                           std::pair{"EDEN_PS5_GPU_SPIN_US", "300"},
-                                          std::pair{"EDEN_PS5_WORKER_SPIN_US", "300"}}) {
+                                          std::pair{"EDEN_PS5_WORKER_SPIN_US", "300"},
+                                          std::pair{"EDEN_NX2_UNBACKED_LIMIT", "0"}}) {
             setenv(name, value, 0);
         }
 #ifdef EDEN_MKW_DIAGNOSTICS

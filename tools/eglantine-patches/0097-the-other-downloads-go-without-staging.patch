@@ -1,0 +1,243 @@
+caches: the downloads 0089 left go without a staging buffer
+
+Three more places threw when the pool refused a download:
+
+Nx2CopyListPages takes no copy of the page. copy_writes falls behind writes, so reads of that page
+report Unknown and drain the split, as for a page without a copy.
+
+CommitAsyncFlushes drops the image downloads of that batch. They run ahead of a read that may not
+come. The entries stay in committed_downloads, marked dropped, because one may hold a deleted image
+alive until its fence.
+
+Staying GPU modified does not bring a read to those images. They have forced_flushed set, so
+GetFlushArea makes the area preemtive and OnCPURead returns with no flush: that is what the fence
+download was for. On a Switch 2 title with no fastmem arena a read of a page without its GPU written
+mark does not even ask, and only the buffer cache marks pages. A core may also keep the area of an
+earlier read until the read trap generation moves. FlushOnNextRead clears all three. The generation
+moves at most once in 250 ms, the length of the pool's pause, so that a large image that is refused
+again does not cost a GPU thread round trip for every word the guest reads.
+
+DownloadImageIntoBuffer still does the GPU copy into the buffer. Only the extra copy for guest
+memory goes, and ObtainBuffer has marked that range as written. The request moves above the slot
+insert so a refusal leaves nothing behind.
+
+TextureCache::DownloadMemory is not here: on the console vulkan_download_batch.inc returns before
+that loop. The fork patch handles it, and needs ReservedDownloadBuffer and FlushOnNextRead from this
+one: land them in one commit.
+
+The whole-image branch of PopAsyncFlushes is left too: IMPLEMENTS_ASYNC_DOWNLOADS is true for
+Vulkan, so it is not built.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 4a954e5..f999520 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -1965,7 +1965,13 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
+             if (begin >= end) {
+                 continue;
+             }
+-            Nx2Staging staging = runtime.DownloadStagingBuffer(page_size, true);
++            // No copy: entry.copy_writes falls behind, and reads of the page drain the split.
++            const std::optional<Nx2Staging> staged =
++                runtime.TryDownloadStagingBuffer(page_size, true);
++            if (!staged) {
++                continue;
++            }
++            Nx2Staging staging = *staged;
+             const BufferCopy copy{
+                 .src_offset = buffer.Offset(begin),
+                 .dst_offset = staging.offset + (begin - page),
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index ffa94e4..27269b5 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -1295,6 +1295,10 @@ std::optional<StagingBufferRef> TextureCacheRuntime::TryDownloadStagingBuffer(si
+     return staging_buffer_pool.TryRequest(size, MemoryUsage::Download, deferred);
+ }
+ 
++StagingBufferRef TextureCacheRuntime::ReservedDownloadBuffer() noexcept {
++    return staging_buffer_pool.ReservedDownload();
++}
++
+ void TextureCacheRuntime::FreeDeferredStagingBuffer(StagingBufferRef& ref) {
+     staging_buffer_pool.FreeDeferred(ref);
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 70ddc48..cc87a5c 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -72,6 +72,8 @@ public:
+ 
+     std::optional<StagingBufferRef> TryDownloadStagingBuffer(size_t size, bool deferred = false);
+ 
++    [[nodiscard]] StagingBufferRef ReservedDownloadBuffer() noexcept;
++
+     void FreeDeferredStagingBuffer(StagingBufferRef& ref);
+ 
+     void TickFrame();
+diff --git a/src/video_core/texture_cache/pending_download.h b/src/video_core/texture_cache/pending_download.h
+index 52a48e8..3455301 100644
+--- a/src/video_core/texture_cache/pending_download.h
++++ b/src/video_core/texture_cache/pending_download.h
+@@ -17,6 +17,9 @@ struct PendingImageDownload {
+     size_t async_buffer_id;
+     Common::SlotId object_id;
+     std::shared_ptr<Image> retired_image{};
++    /// No staging buffer at commit: nothing to write back when the fence pops. The entry stays
++    /// because it may keep a deleted image alive until the GPU is done with it.
++    bool dropped{};
+ 
+     Image& GetImage(Common::SlotVector<Image>& images) const {
+         return retired_image ? *retired_image : images[object_id];
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 0e8b68f..58ec0a6 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -64,6 +64,16 @@ template <typename Runtime>
+     }
+ }
+ 
++// A staging buffer for a download, or nothing when the pool has none.
++template <typename Runtime>
++[[nodiscard]] auto TryDownloadStaging(Runtime& runtime, size_t size, bool deferred) {
++    if constexpr (requires { runtime.TryDownloadStagingBuffer(size, deferred); }) {
++        return runtime.TryDownloadStagingBuffer(size, deferred);
++    } else {
++        return std::optional{runtime.DownloadStagingBuffer(size, deferred)};
++    }
++}
++
+ // The same for an upload that has to go now: up to a stream region the pool waits for the GPU and
+ // always gives one, so only a larger request can come back empty.
+ template <typename Runtime>
+@@ -1477,6 +1487,28 @@ bool TextureCache<P>::ShouldWaitAsyncFlushes() const noexcept {
+     return !committed_downloads.empty() && !committed_downloads.front().empty();
+ }
+ 
++template <class P>
++void TextureCache<P>::FlushOnNextRead(ImageBase& image) {
++    using namespace std::chrono_literals;
++    // An image downloaded at fences has forced_flushed set, and a read of it goes by without a
++    // flush (GetFlushArea makes the area preemtive, OnCPURead returns on that). With no download
++    // nothing would bring the bytes until a later fence gets a buffer. Three things stand in the
++    // way of the read: the flag, a page without its GPU written mark on a Switch 2 title with no
++    // fastmem arena (HandleRasterizerDownload reads those directly, and only the buffer cache
++    // marks pages), and the area a core kept from an earlier read, which holds until the read trap
++    // generation moves. Every read after that asks the GPU thread, so the generation moves at most
++    // as often as the pool looks for new memory: a read of a large image that is refused again
++    // must not cost a round trip per word.
++    image.info.forced_flushed = false;
++    if (Tegra::g_nx2_ampere.load(std::memory_order_relaxed)) {
++        Tegra::Nx2MarkGpuWritten(image.cpu_addr, image.guest_size_bytes);
++    }
++    if (const auto now = std::chrono::steady_clock::now(); now - read_areas_ended >= 250ms) {
++        read_areas_ended = now;
++        device_memory.ArmReadTraps(image.cpu_addr, image.guest_size_bytes);
++    }
++}
++
+ template <class P>
+ void TextureCache<P>::CommitAsyncFlushes() {
+     // This is intentionally passing the value by copy
+@@ -1518,16 +1550,33 @@ void TextureCache<P>::CommitAsyncFlushes() {
+                                 image.info.layer_stride, image.guest_size_bytes, image.unswizzled_size_bytes);
+                 }
+             }
+-            auto download_map = runtime.DownloadStagingBuffer(total_size_bytes, true);
+-            for (const PendingDownload& download_info : download_ids) {
+-                if (download_info.is_swizzle) {
+-                    Image& image = download_info.GetImage(slot_images);
+-                    const auto copies = FullDownloadCopies(image.info);
+-                    image.DownloadMemory(download_map, copies);
+-                    download_map.offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
++            if (auto staged = TryDownloadStaging(runtime, total_size_bytes, true)) {
++                auto& download_map = *staged;
++                for (const PendingDownload& download_info : download_ids) {
++                    if (download_info.is_swizzle) {
++                        Image& image = download_info.GetImage(slot_images);
++                        const auto copies = FullDownloadCopies(image.info);
++                        image.DownloadMemory(download_map, copies);
++                        download_map.offset += Common::AlignUp(image.unswizzled_size_bytes, 64);
++                    }
++                }
++                uncommitted_async_buffers.emplace_back(download_map);
++            } else {
++                // These downloads run ahead of a read that may not come. A read that does come
++                // flushes them now, since nothing else will.
++                static u64 times = 0;
++                if (++times; (times & (times - 1)) == 0) { // the 1st, 2nd, 4th, 8th ... time
++                    LOG_WARNING(HW_GPU, "No staging buffer for {} bytes of image downloads, {} "
++                                        "times so far: dropped",
++                                total_size_bytes, times);
++                }
++                for (PendingDownload& download_info : download_ids) {
++                    if (download_info.is_swizzle) {
++                        download_info.dropped = true;
++                        FlushOnNextRead(download_info.GetImage(slot_images));
++                    }
+                 }
+             }
+-            uncommitted_async_buffers.emplace_back(download_map);
+         }
+ 
+         async_buffers.emplace_back(std::move(uncommitted_async_buffers));
+@@ -1552,6 +1601,9 @@ void TextureCache<P>::PopAsyncFlushes() {
+         auto download_map = std::move(async_buffers.front());
+         for (size_t i = download_ids.size(); i > 0; i--) {
+             auto& download_info = download_ids[i - 1];
++            if (download_info.dropped) {
++                continue;
++            }
+             auto& download_buffer = download_map[download_info.async_buffer_id];
+             if (download_info.is_swizzle) {
+                 const ImageBase& image = download_info.GetImage(slot_images);
+@@ -1720,11 +1772,18 @@ void TextureCache<P>::DownloadImageIntoBuffer(typename TextureCache<P>::Image* i
+                                               std::span<const VideoCommon::BufferImageCopy> copies,
+                                               GPUVAddr address, size_t size) {
+     if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
++        auto staged = TryDownloadStaging(runtime, size, true);
++        if (!staged) {
++            // The buffer gets its bytes on the GPU. Its range is marked as written, so guest
++            // memory gets them the way it gets any buffer's.
++            image->DownloadMemory(buffer, buffer_offset, copies);
++            return;
++        }
++        auto& download_map = *staged;
+         const BufferDownload new_buffer_download{address, size};
+         auto slot = slot_buffer_downloads.insert(new_buffer_download);
+         const PendingDownload new_download{false, uncommitted_async_buffers.size(), slot};
+         uncommitted_downloads.emplace_back(new_download);
+-        auto download_map = runtime.DownloadStagingBuffer(size, true);
+         uncommitted_async_buffers.emplace_back(download_map);
+         std::array buffers{
+             buffer,
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index ca9b6d0..cd93446 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <chrono>
+ #include <deque>
+ #include <limits>
+ #include <map>
+@@ -513,6 +514,9 @@ private:
+     /// Bind an image view as render target, downloading resources preemtively if needed
+     void BindRenderTarget(ImageViewId* old_id, ImageViewId new_id);
+ 
++    /// A download of this image found no staging buffer: the next guest read asks for it again
++    void FlushOnNextRead(ImageBase& image);
++
+     /// Create a render target from a given image and image view parameters
+     [[nodiscard]] std::pair<FramebufferId, ImageViewId> RenderTargetFromImage(
+         ImageId, const ImageViewInfo& view_info);
+@@ -642,6 +646,7 @@ private:
+     Common::ScratchBuffer<u8> unswizzle_data_buffer;
+ 
+     u64 modification_tick = 0;
++    std::chrono::steady_clock::time_point read_areas_ended{};
+     u64 frame_tick = 0;
+ 
+     Common::ThreadWorker texture_decode_worker{1, "TextureDecoder", {},

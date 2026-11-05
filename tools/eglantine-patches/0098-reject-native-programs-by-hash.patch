@@ -1,0 +1,39 @@
+shader_environment: EDEN_NX2_REJECT_HASH
+
+EDEN_NX2_REJECT takes program addresses, which change between runs. This matches the
+native program key or the hash of the lowered code, as Lichii's switch does (c9ebb5c3a,
+PR 87). It makes the reject lists of Lichii issue 101 usable in env.txt. The hash of the
+lowered code only matches where our lowering gives the same code as theirs.
+A diagnostic: no change unless the variable is set.
+
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+index bf1cef1..0444c13 100644
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -570,6 +570,26 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
+     // unreachable data. Existing disk-cache serialization carries it with code.
+     lowered_code.push_back(0);
+     Shader::Ampere::AppendNativeAddressMap(lowered_code, lowered.source_instruction_offsets);
++    // EDEN_NX2_REJECT_HASH=<hash>,...: like EDEN_NX2_REJECT, but by what stays the same between
++    // runs: the native program key (EDEN_NX2_SHADER_DUMP file names) or the hash of the lowered
++    // code, the one Lichii's frame dumps show. Lower case, no 0x. A program already in the disk
++    // cache doesn't pass through here.
++    if (static const std::string reject_hashes = [] {
++            const char* text = std::getenv("EDEN_NX2_REJECT_HASH");
++            return text ? "," + std::string{text} + "," : std::string{};
++        }();
++        !reject_hashes.empty()) {
++        const u64 lowered_hash =
++            Common::CityHash64(reinterpret_cast<const char*>(lowered_code.data()),
++                               lowered_code.size() * sizeof(u64)) ^
++            0x4f554e4345000002ULL;
++        for (const u64 hash : {Shader::Ampere::NativeProgramKey(native), lowered_hash}) {
++            if (reject_hashes.find(fmt::format(",{:016x},", hash)) != std::string::npos) {
++                throw Shader::RuntimeError("Native shader at {:#x} ({:016x}) rejected by EDEN_NX2_REJECT_HASH",
++                                           program_base, hash);
++            }
++        }
++    }
+     LOG_DEBUG(Shader, "Lowered native shader at {:#x}: {} source bytes, {} instructions",
+               program_base, result->source_size, lowered.instructions.size());
+     return result;

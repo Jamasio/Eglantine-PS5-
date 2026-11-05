@@ -1,0 +1,73 @@
+vk_scheduler: switch to pause, not reset, the occlusion counter at each submission
+
+Ported from zortos293/Lichii #121, still open there, both commits by Kajcsi:
+e3cf9394c1 (pause) and 47e1e95208 (bound the running query).
+EndPendingOperations ran CounterReset before every submission. A submission
+landing between a guest's counter reset and its report dropped the samples
+counted so far, so the report read too low, often 0, and Ocarina took it as
+occluded for one frame: Link went white. The split GPU thread and its deferred
+fence flushes make that frequent, and both are on by default here.
+
+A paused query runs on until the guest resets or reports it. Ocarina does
+neither on its title screen and file select, and it reached 16,384 slots over 64
+sample banks. The second commit drops the count, as a reset would, once a query
+passes one bank (256 slots). The longest gameplay window measured was 36 slots.
+
+EDEN_NX2_ZPASS_PAUSE=1 turns all of this on. Default off, which keeps the old
+reset; only this path reaches the samples CloseCounter. The switch is ours, the
+source has none. Inc0rporate reports on that PR that an RX 9070 XT with the
+split on, GPU accuracy Low, hangs in Ocarina right after picking the save with
+the first commit (WaitSubmitted never ends), and PS5 is AMD with the split on
+too. The same build with EDEN_NX2_SPLIT=0 neither hung nor flashed. The source
+author thinks the second commit fixes it but could not reproduce the hang on
+NVIDIA, and it has not been retested on AMD. The source also reports one rarer
+flash left afterwards, not yet explained.
+
+diff --git a/src/video_core/renderer_vulkan/vk_query_cache.cpp b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+index f63c924..c2d9bc9 100644
+--- a/src/video_core/renderer_vulkan/vk_query_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_query_cache.cpp
+@@ -209,8 +209,17 @@ public:
+         last_accumulation_checkpoint = (std::max)(last_accumulation_checkpoint, num_slots_used);
+     }
+ 
++    // Called at each submission with EDEN_NX2_ZPASS_PAUSE=1. The running query carries the count
++    // across it: a guest's reset-to-report window can span one.
+     void CloseCounter() override {
+         PauseCounter();
++        // A title that counts without resetting or reporting grows the query by a slot at every
++        // submission and render pass, and the query keeps every bank it touches alive. Ocarina of
++        // Time's title screen and file select reached 16,384 slots over 64 banks (its gameplay
++        // windows span at most 36 slots). Past a bank, drop the count as a reset would.
++        if (current_query && current_query->size_slots > SamplesQueryBank::BANK_SIZE) {
++            ResetCounter();
++        }
+     }
+ 
+     bool HasPendingSync() const override {
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index f23e07e..ce1851d 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -474,7 +474,20 @@ void Scheduler::InvalidateState() {
+ }
+ 
+ void Scheduler::EndPendingOperations() {
+-    query_cache->CounterReset(VideoCommon::QueryType::ZPassPixelCount64);
++    // EDEN_NX2_ZPASS_PAUSE=1: pause, don't reset. A submission can land between a guest's counter
++    // reset and its report, and resetting here drops the samples counted so far (the report then
++    // reads too low). Off by default: with the split on, pausing hung an AMD host at a game's save
++    // select (Lichii #121), and the bound in SamplesStreamer::CloseCounter meant to stop that has
++    // not been tried on AMD yet.
++    static const bool pause_zpass = [] {
++        const char* value = std::getenv("EDEN_NX2_ZPASS_PAUSE");
++        return value != nullptr && value[0] == '1';
++    }();
++    if (pause_zpass) {
++        query_cache->CounterClose(VideoCommon::QueryType::ZPassPixelCount64);
++    } else {
++        query_cache->CounterReset(VideoCommon::QueryType::ZPassPixelCount64);
++    }
+     EndRenderPass();
+ }
+ 

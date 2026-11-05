@@ -371,8 +371,37 @@ static void *worker(void *argument) {
     return NULL;
 }
 
+// A thread that takes 200 MiB of small blocks, frees them and stays: its arenas stay its own.
+enum { ROOM_BLOCKS = 200 * 64, ROOM_SIZE = 16 << 10 };
+static atomic_int rooms_left, rooms_done;
+static void room_use(void) {
+    static _Thread_local unsigned char *blocks[ROOM_BLOCKS];
+    for (int i = 0; i < ROOM_BLOCKS; ++i) {
+        blocks[i] = __wrap_malloc(ROOM_SIZE);
+        assert(blocks[i] != NULL);
+        fill(blocks[i], ROOM_SIZE, (unsigned)i);
+    }
+    for (int i = 0; i < ROOM_BLOCKS; ++i) { verify(blocks[i], ROOM_SIZE, (unsigned)i); __wrap_free(blocks[i]); }
+}
+static void *room_holder(void *argument) {
+    (void)argument;
+    eden_heap_name_thread("holder");
+    room_use();
+    atomic_fetch_add(&rooms_left, 1);
+    while (!atomic_load(&rooms_done)) usleep(1000);
+    return NULL;
+}
+static void *room_taker(void *argument) {
+    (void)argument;
+    eden_heap_name_thread("taker");
+    room_use();
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     refuse_range = argc > 1 && strcmp(argv[1], "whole") == 0;
+    // The checks below count the arenas threads make: looking in other arenas has its own, at the end.
+    setenv("EDEN_HEAP_NO_ADOPT", "1", 1);
     const size_t piece = EDEN_HEAP_PIECE_SIZE, heap = (size_t)6144 << 20, whole = (size_t)3072 << 20;
     void *first = __wrap_malloc(100);
     assert(first != NULL);
@@ -564,6 +593,39 @@ int main(int argc, char **argv) {
         assert(eden_heap_trim() > 0);
         printf("given back: %zu MiB of %zu, then %d blocks of 24 MiB again in the same range\n", given >> 20,
                full >> 20, again_count);
+    }
+    if (!refuse_range) {
+        // Room two threads left behind in their arenas, 400 MiB held and not in use, while the
+        // threads are still there: a third that needs half of it takes those arenas before the
+        // heap makes new ones, and the report asks every arena and space while it does.
+        pthread_t holders[2], taker;
+        const size_t held_before_rooms = eden_heap_committed();
+        for (int i = 0; i < 2; ++i) assert(pthread_create(&holders[i], NULL, room_holder, NULL) == 0);
+        while (atomic_load(&rooms_left) != 2) usleep(1000);
+        const size_t held_after_first = eden_heap_committed();
+        unsetenv("EDEN_HEAP_NO_ADOPT");
+        const unsigned arenas_before_taker = eden_heap_arenas_created();
+        const unsigned long long adopted_before = atomic_load(&eden_heap_adopted);
+        assert(pthread_create(&taker, NULL, room_taker, NULL) == 0);
+        eden_heap_arena_report();
+        pthread_join(taker, NULL);
+        const size_t held_after_second = eden_heap_committed();
+        const unsigned long long adopted = atomic_load(&eden_heap_adopted) - adopted_before;
+        eden_heap_growth_report();
+        if (!(adopted > 0 && held_after_second <= held_after_first + ((size_t)64 << 20) &&
+              eden_heap_arenas_created() <= arenas_before_taker + 16)) {
+            fprintf(stderr, "room left behind: %zu -> %zu -> %zu MiB of pieces, arenas %u -> %u, %llu taken\n", held_before_rooms >> 20,
+                    held_after_first >> 20, held_after_second >> 20, arenas_before_taker, eden_heap_arenas_created(), adopted);
+            abort();
+        }
+        printf("room left behind: %zu MiB of pieces, %zu MiB after a thread used it, %llu arenas taken\n",
+               held_after_first >> 20, held_after_second >> 20, adopted);
+        // Blocks of every size again, on threads that now take each other's arenas.
+        pthread_t churn[8];
+        for (uintptr_t i = 0; i < 8; ++i) assert(pthread_create(&churn[i], NULL, worker, (void *)(i + 11)) == 0);
+        for (int i = 0; i < 8; ++i) pthread_join(churn[i], NULL);
+        atomic_store(&rooms_done, 1);
+        for (int i = 0; i < 2; ++i) pthread_join(holders[i], NULL);
     }
     // After that, everything still works.
     unsigned char *again = __wrap_malloc(1000);

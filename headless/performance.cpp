@@ -388,6 +388,9 @@ extern "C" std::size_t eden_heap_large_held(unsigned* blocks) __attribute__((wea
 extern "C" std::size_t eden_heap_trim(void) __attribute__((weak));
 extern "C" void eden_heap_sites_report(void) __attribute__((weak));
 extern "C" void eden_heap_usage(std::size_t* held, std::size_t* in_use, std::size_t* returned) __attribute__((weak));
+extern "C" void eden_heap_growth_report(void) __attribute__((weak));
+extern "C" void eden_heap_arena_report(void) __attribute__((weak));
+extern "C" void eden_heap_name_thread(const char* name) __attribute__((weak));
 extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
 extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target) __attribute__((weak));
 extern "C" void eden_guest_memory_report(void) __attribute__((weak));
@@ -501,6 +504,19 @@ void ReportHeap(const char* why) {
                          "%zu MiB of it in use; %zu MiB given back so far (%s)\n",
                  held >> 20, (held - large) >> 20, large >> 20, large_blocks, in_use >> 20, returned >> 20, why);
     if (eden_heap_sites_report) eden_heap_sites_report();
+    if (eden_heap_growth_report) eden_heap_growth_report();
+    // What holds the room, arena by arena: it asks every one of them, so at the first refusals
+    // once in 30 s at most, and then once in 2 minutes, to keep the end of a session in the log.
+    static std::atomic<long long> arenas_ns{0};
+    static std::atomic<unsigned> arena_reports{0};
+    const long long now = NowNs();
+    long long last = arenas_ns.load(std::memory_order_relaxed);
+    const long long gap = arena_reports.load(std::memory_order_relaxed) < 3 ? 30'000'000'000 : 120'000'000'000;
+    if (eden_heap_arena_report && std::strstr(why, "refused") && (last == 0 || now - last >= gap) &&
+        arenas_ns.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+        arena_reports.fetch_add(1, std::memory_order_relaxed);
+        eden_heap_arena_report();
+    }
 }
 
 std::size_t TrimHeap(const char* why) {
@@ -852,6 +868,7 @@ void RegisterWorker(const char* name) {
     MkwNativeSample::Register(name);
 #endif
     Eden::Crash::NameThread(name);  // a crash report names the thread
+    if (eden_heap_name_thread) eden_heap_name_thread(name);  // and the heap's reports
 #if defined(EDEN_DEV_PROFILE) && defined(PS5_NATIVE)
     Eden::Stall::NoteThread(name);
 #endif
