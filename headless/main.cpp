@@ -1162,6 +1162,20 @@ int main(int argc, char** argv) {
             if (speed.unsafe_dma) Settings::values.dma_accuracy.SetValue(Settings::DmaAccuracy::Unsafe);
             Settings::values.use_reactive_flushing.SetValue(speed.reactive_flushing);
             Settings::values.skip_cpu_inner_invalidation.SetValue(speed.skip_invalidation);
+            {
+                // Eden's gpu_fence_behavior has no setting here: EDEN_GPU_FENCE in env.txt
+                // (immediate, balanced or accurate) chooses it, every session, like the levels
+                // above. Unset or anything else: Default.
+                auto fence = Settings::GpuFenceBehavior::Default;
+                if (const char* chosen = std::getenv("EDEN_GPU_FENCE")) {
+                    const std::string_view name{chosen};
+                    if (name == "immediate") fence = Settings::GpuFenceBehavior::Immediate;
+                    if (name == "balanced") fence = Settings::GpuFenceBehavior::Balanced;
+                    if (name == "accurate") fence = Settings::GpuFenceBehavior::Accurate;
+                }
+                Settings::values.gpu_fence_behavior.SetValue(fence);
+                std::printf("EDEN_GPU_FENCE %u\n", unsigned(fence));
+            }
             // The block list is off unless the settings turn it on (block-list.txt in the app
             // folder still does, further down).
             if (!dev_block_list) Eden::JitList::enabled = speed.block_list;

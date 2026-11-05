@@ -74,6 +74,19 @@
  *
  * What holds the room. EDEN_HEAP_GROWTH (every 20 s) says which requests made the heap grow and
  * who asked; at a refusal, eden_heap_arena_report asks every arena and space how much it has left.
+ *
+ * Empty arenas given back. An arena stayed with its record for good, full or empty: Ocarina of Time
+ * (run 51) held 976 MiB it did not use, 589 MiB of it room in 458 arenas, 155 of them empty, and
+ * the shader builders alone held 100 empty arenas of their 241. An arena that holds no block now
+ * goes back to its space when its thread ends (eden_heap_thread_exit) and whenever the heap is
+ * trimmed (eden_heap_trim: the pool short, a build or session over, an allocation about to be
+ * refused), from every record, the ended ones too. A record keeps its first arena, so the next
+ * thread on it starts with one; an arena a thread is on now, or one the record of an ended thread
+ * still names, stays. The room goes to the space the arena was in, for any request, and a space
+ * left with no block goes back to the system in the same trim. Every arena counts its blocks for
+ * this (a block kept in a thread's cache is one); the paths that read the list of arenas or a
+ * record's arenas (a thread out of room, the reports) now run under the creation lock, the lock
+ * an arena is given back under. EDEN_HEAP_KEEP_ARENAS in the environment turns this off.
  */
 #include <pthread.h>
 #include <stdio.h>
@@ -122,10 +135,18 @@ void *eden_heap_split_pages(size_t size);         /* a large block in pieces of 
 void eden_heap_split_pages_free(void *address, size_t size);
 
 static void *_Atomic eden_heap_slots[EDEN_HEAP_SLOTS]; /* arena mspace owning each slot */
-static void *eden_heap_arena_list[EDEN_HEAP_MAX_ARENAS];
+static void *eden_heap_arena_list[EDEN_HEAP_MAX_ARENAS]; /* NULL: given back, free for a new one */
 static void *_Atomic eden_heap_arena_blocks_probe[EDEN_HEAP_MAX_ARENAS];
 static atomic_size_t eden_heap_arena_backing_probe;
-static atomic_uint eden_heap_arena_count;
+static atomic_uint eden_heap_arena_count; /* entries of the list in use, those given back too */
+static atomic_uint eden_heap_arena_holes; /* entries given back and not taken again */
+static atomic_ullong eden_heap_arenas_returned;
+/* The blocks alive in each slot's arena, one cache line each: the first arenas of threads made
+ * together lie in neighbouring slots, and their every request would share one line otherwise. */
+static struct {
+  atomic_long blocks;
+  char pad[64 - sizeof(atomic_long)];
+} __attribute__((aligned(64))) eden_heap_arena_live[EDEN_HEAP_SLOTS];
 static unsigned eden_heap_first_arenas; /* first arenas made (under the creation lock) */
 static atomic_uint eden_heap_next_shared;
 static pthread_key_t eden_heap_arena_key;
@@ -217,6 +238,15 @@ unsigned long eden_heap_create_lock_state(unsigned *waiters) {
 
 static void *eden_heap_owner(const void *address);
 static void eden_heap_free_owned(void *address);
+struct eden_heap_thread;
+static void eden_heap_return_record(struct eden_heap_thread *record, int ended);
+static unsigned eden_heap_return_arenas(void);
+static void eden_heap_use_arena(struct eden_heap_thread *self, void *arena);
+
+/* Empty arenas stay with their records, as they did before (EDEN_HEAP_KEEP_ARENAS). */
+static int eden_heap_keeps_arenas(void) {
+  return getenv("EDEN_HEAP_KEEP_ARENAS") != NULL;
+}
 
 /* Per-thread allocation statistics. The live/peak/block counters are process-wide atomics, and
  * updating them on every malloc and free made all allocating threads bounce the same cache
@@ -316,11 +346,24 @@ static void eden_heap_thread_exit(void *value) {
     __atomic_store_n(&self->counts[bin], 0, __ATOMIC_RELAXED);
   }
   eden_heap_flush(self);
+  /* Its empty arenas go back; the record still holds the thread's, so no other thread takes it. */
+  if (!eden_heap_keeps_arenas()) {
+    eden_heap_create_acquire();
+    eden_heap_return_record(self, 1);
+    eden_heap_create_release();
+  }
   atomic_store_explicit(&eden_heap_thread_used[self - eden_heap_threads], 0, memory_order_release);
 }
 
+/* The arenas there are now (the list's entries given back are not counted). */
 unsigned eden_heap_arenas_created(void) {
-  return atomic_load_explicit(&eden_heap_arena_count, memory_order_relaxed);
+  return atomic_load_explicit(&eden_heap_arena_count, memory_order_relaxed) -
+         atomic_load_explicit(&eden_heap_arena_holes, memory_order_relaxed);
+}
+
+/* Empty arenas given back to their spaces since the process began. */
+unsigned long long eden_heap_arenas_given_back(void) {
+  return atomic_load_explicit(&eden_heap_arenas_returned, memory_order_relaxed);
 }
 
 /* Memory the heap's pieces hold now (pieces given back are not counted). */
@@ -488,6 +531,19 @@ static uintptr_t eden_heap_slot(const void *address) {
          ((uintptr_t)ps5_heap_base >> EDEN_HEAP_ARENA_SHIFT);
 }
 
+/* A block taken from the arena of its slot, and one given back to it. The count is the mspace's:
+ * a block in a thread's cache is still taken. It is read, for an arena no thread is on, under the
+ * creation lock (eden_heap_return_record): a block is counted after it is taken and after it is
+ * freed, so a count read early says the arena is fuller than it is, never emptier. A realloc to
+ * size 0 that frees the block leaves it counted (the console does not say); that arena stays. */
+static void eden_heap_arena_took(const void *address) {
+  atomic_fetch_add_explicit(&eden_heap_arena_live[eden_heap_slot(address)].blocks, 1, memory_order_relaxed);
+}
+
+static void eden_heap_arena_gave(const void *address) {
+  atomic_fetch_sub_explicit(&eden_heap_arena_live[eden_heap_slot(address)].blocks, 1, memory_order_relaxed);
+}
+
 /* The slot tail belongs to the parent mspace and can hold ordinary allocations. */
 static void *eden_heap_arena_owner(const void *address) {
   if (((uintptr_t)address & (EDEN_HEAP_ARENA_SIZE - 1u)) >= EDEN_HEAP_ARENA_PAYLOAD)
@@ -519,9 +575,10 @@ static void eden_heap_space_free(void *address) {
 /* Frees an owned block (not a large one) to its arena or its space. */
 static void eden_heap_free_owned(void *address) {
   void *arena = eden_heap_arena_owner(address);
-  if (arena != NULL)
+  if (arena != NULL) {
     sceLibcMspaceFree(arena, address);
-  else
+    eden_heap_arena_gave(address);
+  } else
     eden_heap_space_free(address);
 }
 
@@ -710,7 +767,11 @@ static int eden_heap_grow(size_t bytes, unsigned seen) {
  * space is retired, its memory released, its address space kept for a later growth. Returns the
  * bytes given back. */
 size_t eden_heap_trim(void) {
-  if (atomic_load_explicit(&ps5_heap_state, memory_order_acquire) != 2 || !eden_heap_grows)
+  if (atomic_load_explicit(&ps5_heap_state, memory_order_acquire) != 2)
+    return 0;
+  /* Empty arenas first: a space left with none of them may go back below. */
+  eden_heap_return_arenas();
+  if (!eden_heap_grows)
     return 0;
   eden_heap_grow_acquire();
   size_t returned = 0;
@@ -803,22 +864,33 @@ static void *eden_heap_main(int kind, size_t a, size_t b) {
 }
 
 /* Allocate and register one arena block from the heap (NULL on failure, or at the limit: of first
- * arenas for a thread's first, of all arenas for another). */
-static void *eden_heap_create_arena(int first) {
-  eden_heap_create_acquire();
+ * arenas for a thread's first, of all arenas for another). Under the creation lock. */
+static void *eden_heap_create_arena_locked(int first) {
   void *arena = NULL;
   const unsigned count = atomic_load_explicit(&eden_heap_arena_count, memory_order_relaxed);
-  if (count < EDEN_HEAP_MAX_ARENAS && (!first || eden_heap_first_arenas < EDEN_HEAP_FIRST_ARENAS)) {
+  /* An entry given back, else a new one. */
+  unsigned at = count;
+  if (atomic_load_explicit(&eden_heap_arena_holes, memory_order_relaxed) != 0)
+    for (unsigned i = 0; i < count; ++i)
+      if (eden_heap_arena_list[i] == NULL) {
+        at = i;
+        break;
+      }
+  if (at < EDEN_HEAP_MAX_ARENAS && (!first || eden_heap_first_arenas < EDEN_HEAP_FIRST_ARENAS)) {
     void *block = eden_heap_main(EDEN_HEAP_ALIGNED, EDEN_HEAP_ARENA_SIZE, EDEN_HEAP_ARENA_PAYLOAD);
     if (block != NULL) {
       arena = sceLibcMspaceCreate("Eden-arena", block, EDEN_HEAP_ARENA_PAYLOAD, 0);
       if (arena != NULL) {
         const uintptr_t slot = eden_heap_slot(block);
-        eden_heap_arena_list[count] = arena;
-        eden_heap_arena_blocks_probe[count] = block;
+        eden_heap_arena_list[at] = arena;
+        eden_heap_arena_blocks_probe[at] = block;
         atomic_fetch_add_explicit(&eden_heap_arena_backing_probe, sceLibcMspaceMallocUsableSize(block), memory_order_relaxed);
+        atomic_store_explicit(&eden_heap_arena_live[slot].blocks, 0, memory_order_relaxed);
         atomic_store_explicit(&eden_heap_slots[slot], arena, memory_order_release);
-        atomic_store_explicit(&eden_heap_arena_count, count + 1, memory_order_release);
+        if (at == count)
+          atomic_store_explicit(&eden_heap_arena_count, count + 1, memory_order_release);
+        else
+          atomic_fetch_sub_explicit(&eden_heap_arena_holes, 1, memory_order_relaxed);
         if (first)
           eden_heap_first_arenas++;
       } else {
@@ -826,8 +898,86 @@ static void *eden_heap_create_arena(int first) {
       }
     }
   }
-  eden_heap_create_release();
   return arena;
+}
+
+/* The arenas threads are on now (every record's, an ended thread's record too: the next thread
+ * on it starts there). Under the creation lock, which the table is used under. */
+static void *eden_heap_named_arenas[EDEN_HEAP_THREADS];
+static unsigned eden_heap_arenas_named(void **named) {
+  unsigned count = 0;
+  for (unsigned i = 0; i < EDEN_HEAP_THREADS; ++i) {
+    void *arena = __atomic_load_n(&eden_heap_threads[i].arena, __ATOMIC_RELAXED);
+    if (arena != NULL)
+      named[count++] = arena;
+  }
+  return count;
+}
+
+/* Gives a record's empty arenas back to their spaces: all but its first, and but those a thread is
+ * on (the list of them is read here, so a thread that takes one and is not on it yet, in a path
+ * under the creation lock, is excluded by the lock). `ended`: no thread is on the record (its own
+ * is ending, or it is claimed with eden_heap_thread_used 2), so its arena is set to its first
+ * before the look, and its empty current one may go. Under the creation lock. */
+static void eden_heap_return_record(struct eden_heap_thread *record, int ended) {
+  unsigned owned = __atomic_load_n(&record->owned, __ATOMIC_ACQUIRE);
+  if (owned < 2)
+    return;
+  if (ended)
+    eden_heap_use_arena(record, __atomic_load_n(&record->own[0], __ATOMIC_RELAXED));
+  void **named = eden_heap_named_arenas;
+  const unsigned names = eden_heap_arenas_named(named);
+  const unsigned count = atomic_load_explicit(&eden_heap_arena_count, memory_order_relaxed);
+  for (unsigned i = 1; i < owned;) {
+    void *arena = __atomic_load_n(&record->own[i], __ATOMIC_RELAXED);
+    unsigned at = 0;
+    while (at < names && named[at] != arena)
+      ++at;
+    unsigned index = 0;
+    while (index < count && eden_heap_arena_list[index] != arena)
+      ++index;
+    void *block = index < count ? atomic_load_explicit(&eden_heap_arena_blocks_probe[index], memory_order_relaxed) : NULL;
+    if (at != names || block == NULL ||
+        atomic_load_explicit(&eden_heap_arena_live[eden_heap_slot(block)].blocks, memory_order_relaxed) != 0) {
+      ++i;
+      continue;
+    }
+    /* No block is in it and no thread is on it: nothing can take from it or free into it now.
+     * Out of the slot's and the list's tables first, then its memory to its space. */
+    atomic_store_explicit(&eden_heap_slots[eden_heap_slot(block)], NULL, memory_order_release);
+    eden_heap_arena_list[index] = NULL;
+    atomic_store_explicit(&eden_heap_arena_blocks_probe[index], NULL, memory_order_relaxed);
+    atomic_fetch_add_explicit(&eden_heap_arena_holes, 1, memory_order_relaxed);
+    atomic_fetch_sub_explicit(&eden_heap_arena_backing_probe, sceLibcMspaceMallocUsableSize(block), memory_order_relaxed);
+    atomic_fetch_add_explicit(&eden_heap_arenas_returned, 1, memory_order_relaxed);
+    for (unsigned k = i; k + 1 < owned; ++k)
+      __atomic_store_n(&record->own[k], __atomic_load_n(&record->own[k + 1], __ATOMIC_RELAXED), __ATOMIC_RELAXED);
+    --owned;
+    __atomic_store_n(&record->owned, owned, __ATOMIC_RELEASE);
+    eden_heap_space_free(block);
+  }
+}
+
+/* Every record's empty arenas back to their spaces (eden_heap_trim). A record no thread is on is
+ * claimed meanwhile (eden_heap_thread_used 2: eden_heap_self passes it over), so none starts on an
+ * arena being given back. Returns the arenas given back. */
+static unsigned eden_heap_return_arenas(void) {
+  if (eden_heap_keeps_arenas())
+    return 0;
+  const unsigned long long before = atomic_load_explicit(&eden_heap_arenas_returned, memory_order_relaxed);
+  eden_heap_create_acquire();
+  for (unsigned i = 0; i < EDEN_HEAP_THREADS; ++i) {
+    unsigned char expected = 0;
+    const int claimed = atomic_compare_exchange_strong_explicit(&eden_heap_thread_used[i], &expected, 2,
+                                                                memory_order_acquire, memory_order_relaxed);
+    if (!claimed && expected != 1)
+      continue;
+    eden_heap_return_record(&eden_heap_threads[i], claimed);
+    if (claimed)
+      atomic_store_explicit(&eden_heap_thread_used[i], 0, memory_order_release);
+  }
+  eden_heap_create_release();
+  return (unsigned)(atomic_load_explicit(&eden_heap_arenas_returned, memory_order_relaxed) - before);
 }
 
 /* This thread's record, claimed on its first allocation. NULL: none free (process-wide counters). */
@@ -900,22 +1050,27 @@ static void *eden_heap_thread_arena(void) {
     return NULL;
   if (self->arena != NULL)
     return self->arena;
-  void *arena = eden_heap_create_arena(1);
+  eden_heap_create_acquire();
+  void *arena = eden_heap_create_arena_locked(1);
   if (arena == NULL) {
-    /* Arena limit reached: share the existing arenas round-robin. */
+    /* Arena limit reached: share the existing arenas round-robin (past the entries given back). */
     const unsigned count = atomic_load_explicit(&eden_heap_arena_count, memory_order_acquire);
-    if (count == 0)
-      return NULL;
-    arena = eden_heap_arena_list[atomic_fetch_add_explicit(&eden_heap_next_shared, 1, memory_order_relaxed) % count];
+    for (unsigned i = 0; i < count && arena == NULL; ++i)
+      arena = eden_heap_arena_list[atomic_fetch_add_explicit(&eden_heap_next_shared, 1, memory_order_relaxed) % count];
   } else if (self->owned < EDEN_HEAP_THREAD_ARENAS) {
     eden_heap_keep_arena(self, arena);
   }
-  eden_heap_use_arena(self, arena);
+  if (arena != NULL)
+    eden_heap_use_arena(self, arena);
+  eden_heap_create_release();
   return arena;
 }
 
 static void *eden_heap_arena_try(void *arena, size_t count, size_t size, int zero) {
-  return zero ? sceLibcMspaceCalloc(arena, count, size) : sceLibcMspaceMalloc(arena, count * size);
+  void *address = zero ? sceLibcMspaceCalloc(arena, count, size) : sceLibcMspaceMalloc(arena, count * size);
+  if (address != NULL)
+    eden_heap_arena_took(address);
+  return address;
 }
 
 static atomic_uint eden_heap_adopt_next;
@@ -924,7 +1079,8 @@ static atomic_ullong eden_heap_adopted, eden_heap_adopt_misses;
 /* A block from an arena no thread is using, which this thread then uses; NULL when the heap holds
  * little more than is in use, or none of the arenas asked has room. The owner of an arena taken
  * here may come back to it: the two then share it, as threads past the limit always have. Runs
- * once a thread is out of room, which takes at least the room asked for here. */
+ * once a thread is out of room, which takes at least the room asked for here. Under the creation
+ * lock: the list is read. */
 static void *eden_heap_adopt(struct eden_heap_thread *self, size_t count, size_t size, int zero) {
   const size_t held = atomic_load_explicit(&eden_heap_committed_bytes, memory_order_relaxed) +
                       atomic_load_explicit(&eden_heap_large_bytes, memory_order_relaxed);
@@ -945,6 +1101,8 @@ static void *eden_heap_adopt(struct eden_heap_thread *self, size_t count, size_t
   unsigned asked = 0;
   for (unsigned i = 0; i < arenas && asked < EDEN_HEAP_ADOPT_TRIES; ++i) {
     void *other = eden_heap_arena_list[(start + i) % arenas];
+    if (other == NULL)
+      continue;
     unsigned at = 0;
     while (at < busy_count && busy[at] != other)
       ++at;
@@ -970,7 +1128,8 @@ static void *eden_heap_adopt(struct eden_heap_thread *self, size_t count, size_t
  * own with room, which it then uses; when none has, an arena no thread is using, while the heap
  * holds much more than is in use (eden_heap_adopt); else a new one (for a request under
  * EDEN_HEAP_ARENA_GROW_REQUEST, while the thread and the process are under their limits). NULL:
- * the heap's own spaces take the request. */
+ * the heap's own spaces take the request. Past the arena the thread is on, under the creation
+ * lock: the thread's arenas and the list are read, and an empty arena is given back under it. */
 static void *eden_heap_arena_allocate(size_t count, size_t size, int zero) {
   void *arena = eden_heap_thread_arena();
   if (arena == NULL)
@@ -985,6 +1144,7 @@ static void *eden_heap_arena_allocate(size_t count, size_t size, int zero) {
     --self->retry;
     return NULL;
   }
+  eden_heap_create_acquire();
   for (unsigned i = 0; i < self->owned; ++i) {
     void *other = self->own[i];
     if (other == arena)
@@ -992,24 +1152,27 @@ static void *eden_heap_arena_allocate(size_t count, size_t size, int zero) {
     address = eden_heap_arena_try(other, count, size, zero);
     if (address != NULL) {
       eden_heap_use_arena(self, other);
+      eden_heap_create_release();
       return address;
     }
   }
-  if (count * size >= EDEN_HEAP_ARENA_GROW_REQUEST)
-    return NULL;
-  address = eden_heap_adopt(self, count, size, zero);
-  if (address != NULL)
-    return address;
-  void *fresh = self->owned < EDEN_HEAP_THREAD_ARENAS ? eden_heap_create_arena(0) : NULL;
-  if (fresh == NULL) {
-    /* At a limit, or no memory for one: each look through the arenas costs a request to each,
-     * so the next few requests go straight to the heap's spaces. */
-    self->retry = EDEN_HEAP_ARENA_RETRY;
-    return NULL;
+  if (count * size < EDEN_HEAP_ARENA_GROW_REQUEST) {
+    address = eden_heap_adopt(self, count, size, zero);
+    if (address == NULL) {
+      void *fresh = self->owned < EDEN_HEAP_THREAD_ARENAS ? eden_heap_create_arena_locked(0) : NULL;
+      if (fresh == NULL) {
+        /* At a limit, or no memory for one: each look through the arenas costs a request to each,
+         * so the next few requests go straight to the heap's spaces. */
+        self->retry = EDEN_HEAP_ARENA_RETRY;
+      } else {
+        eden_heap_keep_arena(self, fresh);
+        eden_heap_use_arena(self, fresh);
+        address = eden_heap_arena_try(fresh, count, size, zero);
+      }
+    }
   }
-  eden_heap_keep_arena(self, fresh);
-  eden_heap_use_arena(self, fresh);
-  return eden_heap_arena_try(fresh, count, size, zero);
+  eden_heap_create_release();
+  return address;
 }
 
 /* A small request no arena took, from the heap's spaces, counted with its cycles. */
@@ -1035,6 +1198,7 @@ static void eden_heap_release(void *address) {
   void *arena = eden_heap_arena_owner(address);
   if (arena != NULL) {
     sceLibcMspaceFree(arena, address);
+    eden_heap_arena_gave(address);
     return;
   }
   const unsigned long long start = eden_heap_cycles();
@@ -1285,8 +1449,9 @@ void eden_heap_name_thread(const char *name) {
 void eden_heap_growth_report(void) {
   static const char *const kinds[EDEN_HEAP_GREW_KINDS] = {"arena", "under256K", "under1M", "under8M", "under32M", "large"};
   char line[320];
-  int length = snprintf(line, sizeof(line), "EDEN_HEAP_GROWTH arenas=%u adopted=%llu adopt_misses=%llu spills=%llu grew:",
-                        atomic_load_explicit(&eden_heap_arena_count, memory_order_relaxed),
+  int length = snprintf(line, sizeof(line), "EDEN_HEAP_GROWTH arenas=%u given_back=%llu adopted=%llu adopt_misses=%llu spills=%llu grew:",
+                        eden_heap_arenas_created(),
+                        (unsigned long long)atomic_load_explicit(&eden_heap_arenas_returned, memory_order_relaxed),
                         (unsigned long long)atomic_load_explicit(&eden_heap_adopted, memory_order_relaxed),
                         (unsigned long long)atomic_load_explicit(&eden_heap_adopt_misses, memory_order_relaxed),
                         (unsigned long long)atomic_load_explicit(&eden_heap_spills, memory_order_relaxed));
@@ -1336,7 +1501,7 @@ void eden_heap_arena_report(void) {
   unsigned empty = 0;
   for (unsigned record = 0; record < EDEN_HEAP_THREADS; ++record) {
     struct eden_heap_thread *thread = &eden_heap_threads[record];
-    const unsigned owned = __atomic_load_n(&thread->owned, __ATOMIC_ACQUIRE);
+    unsigned owned = __atomic_load_n(&thread->owned, __ATOMIC_ACQUIRE);
     size_t kept = 0;
     for (unsigned bin = 1; bin < EDEN_TCACHE_BINS; ++bin)
       kept += (size_t)__atomic_load_n(&thread->counts[bin], __ATOMIC_RELAXED) * bin * 16u;
@@ -1346,6 +1511,10 @@ void eden_heap_arena_report(void) {
     char map[EDEN_HEAP_THREAD_ARENAS + 1];
     size_t room = 0;
     unsigned record_empty = 0;
+    /* The record's arenas are read, and asked, under the creation lock: a trim on another thread
+     * gives empty ones back under it. No stdio here: it allocates, and may want the lock. */
+    eden_heap_create_acquire();
+    owned = __atomic_load_n(&thread->owned, __ATOMIC_ACQUIRE);
     for (unsigned i = 0; i < owned; ++i) {
       void *arena = __atomic_load_n(&thread->own[i], __ATOMIC_RELAXED);
       const size_t left = eden_heap_room(arena, (size_t)1 << 20, arena_floor, &largest);
@@ -1353,6 +1522,7 @@ void eden_heap_arena_report(void) {
       record_empty += left + ((size_t)64 << 10) >= EDEN_HEAP_ARENA_PAYLOAD;
       map[i] = "0123456789abcdef"[left >= EDEN_HEAP_ARENA_PAYLOAD ? 15 : left * 16 / EDEN_HEAP_ARENA_PAYLOAD];
     }
+    eden_heap_create_release();
     map[owned] = 0;
     arena_room += room;
     empty += record_empty;
@@ -1374,6 +1544,8 @@ void eden_heap_arena_report(void) {
   const unsigned arenas = atomic_load_explicit(&eden_heap_arena_count, memory_order_acquire);
   for (unsigned i = 0; i < arenas; ++i) {
     const uintptr_t block = (uintptr_t)atomic_load_explicit(&eden_heap_arena_blocks_probe[i], memory_order_relaxed);
+    if (block == 0)
+      continue; /* given back */
     const unsigned slot = atomic_load_explicit(
         &eden_heap_piece_slot[(block - (uintptr_t)ps5_heap_base) >> EDEN_HEAP_PIECE_SHIFT], memory_order_relaxed);
     if (slot < EDEN_HEAP_PIECES)
@@ -1416,7 +1588,7 @@ void eden_heap_arena_report(void) {
   const size_t named = arena_room + space_room + cached;
   fprintf(stderr, "EDEN_HEAP_SLACK %zu MiB not in use: %zu MiB room in %u arenas (%u empty), %zu MiB room in spaces "
                   "(%u held by arenas alone), %zu MiB in thread caches, %zu MiB in smaller holes and headers\n",
-          slack >> 20, arena_room >> 20, arenas, empty, space_room >> 20, only_arenas, cached >> 20,
+          slack >> 20, arena_room >> 20, eden_heap_arenas_created(), empty, space_room >> 20, only_arenas, cached >> 20,
           (slack > named ? slack - named : 0) >> 20);
 }
 
@@ -1547,8 +1719,11 @@ int __wrap_posix_memalign(void **address, size_t alignment, size_t size) {
   int result = ENOMEM;
   if (size < EDEN_HEAP_SMALL_REQUEST && alignment <= 4096) {
     void *arena = eden_heap_thread_arena();
-    if (arena != NULL)
+    if (arena != NULL) {
       result = sceLibcMspacePosixMemalign(arena, address, alignment, size);
+      if (result == 0)
+        eden_heap_arena_took(*address);
+    }
   }
   if (result != 0) {
     /* A large block's own memory starts on a page; the heap's spaces align anything. */

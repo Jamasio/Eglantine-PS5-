@@ -39,6 +39,8 @@ namespace Common {
 void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept;
 // Address space Eden's sparse tables span and the memory they hold (src/memory_pages.cpp).
 void SparseUsage(std::size_t* reserved, std::size_t* committed) noexcept;
+// The memory behind the JIT's code caches (src/memory_pages.cpp).
+void CodeRangeUsage(std::size_t* reserved, std::size_t* committed) noexcept;
 } // namespace Common
 
 #ifdef PS5_NATIVE
@@ -402,6 +404,28 @@ extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::in
 // The allocated region at or after an offset (flag 1: find the next one).
 struct DirectMemoryRegion { std::int64_t start; std::int64_t end; std::int32_t type; };
 extern "C" std::int32_t sceKernelDirectMemoryQuery(std::int64_t, int, DirectMemoryRegion*, std::size_t);
+extern "C" std::int32_t sceKernelAvailableFlexibleMemorySize(std::size_t*);
+extern "C" void eden_direct_ledger(unsigned long long* bytes, unsigned long long* blocks) __attribute__((weak));
+// What is out of the pool by size (src/direct_memory.c) beside what the owners say they hold, and
+// what the second pool has left: the flexible size in sce_sys/param.json is decided from this line
+// (the same call as ProsperoEden's launch line). A release build imports one more kernel function.
+static void ReportLedger() {
+    if (!eden_direct_ledger) return;
+    unsigned long long bytes[4]{}, blocks[4]{};
+    eden_direct_ledger(bytes, blocks);
+    std::size_t span = 0, guest = 0, tables = 0, code = 0, reserve = 0, target = 0, flexible = 0;
+    ::Common::GuestMemoryUsage(&span, &guest);
+    ::Common::SparseUsage(&span, &tables);
+    ::Common::CodeRangeUsage(&span, &code);
+    if (eden_guest_memory_reserve) eden_guest_memory_reserve(&reserve, &target);
+    const bool known = sceKernelAvailableFlexibleMemorySize(&flexible) == 0;
+    std::fprintf(stderr, "EDEN_POOL_LEDGER out of the pool: %llu MiB in %llu blocks under 2 MiB, %llu in %llu of 2 MiB, "
+                 "%llu in %llu up to 32 MiB, %llu in %llu larger; guest %zu reserve %zu heap %zu jit %zu tables %zu MiB; "
+                 "flexible free %lld MiB\n",
+                 bytes[0] >> 20, blocks[0], bytes[1] >> 20, blocks[1], bytes[2] >> 20, blocks[2], bytes[3] >> 20, blocks[3],
+                 guest >> 20, reserve >> 20, (eden_heap_committed ? eden_heap_committed() : std::size_t{0}) >> 20,
+                 code >> 20, tables >> 20, known ? static_cast<long long>(flexible >> 20) : -1LL);
+}
 #endif
 
 #ifdef PS5_NATIVE
@@ -443,6 +467,7 @@ static void RefreshFreeMemory() {
                      largest >> 20, int(view.short_memory), guest_held >> 20,
                      kernel_memory ? kernel_memory() >> 20 : 0ULL);
         ReportHeap("every 20 s");
+        ReportLedger();
     }
     // The last burst of a session falls between two reports of the guest's memory (every 30 s):
     // who wrote it, while the pool's largest block is nearly gone (every 5 s at most).
@@ -593,6 +618,7 @@ void ReportPool() {
                  static_cast<long long>(total >> 20), cut_short ? "at least " : "", free_bytes >> 20, blocks, asked,
                  largest >> 20, from_2_mib >> 20, from_16_mib >> 20, held >> 20, target >> 20,
                  eden_guest_memory_wanted ? eden_guest_memory_wanted() : 0u, kernel_memory ? kernel_memory() >> 20 : 0ULL);
+    ReportLedger();
 #endif
     if (eden_guest_memory_growth) eden_guest_memory_growth();
 }

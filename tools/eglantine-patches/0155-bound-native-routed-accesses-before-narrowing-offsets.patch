@@ -1,0 +1,99 @@
+From: MythosOfs <98063411+MythosOfs@users.noreply.github.com>
+Subject: [PATCH] spirv: bound native routed accesses before narrowing offsets
+
+From Orchid 7553a8025 (MythosOfs), written while reviewing the 32-bit global
+ATOM.CAS of zortos293 a6e5217c7 (Paulo Tumabing), which is 0144 here. A safety
+fix, not a lighting fix.
+
+The native runtime router picks the storage buffer whose base is closest at or
+below the address and converts the 64-bit distance to U32 without checking the
+descriptor's extent, so an address past the buffer reads or writes a wrong
+word of it. The access now also has to fit the runtime array length of the
+selected view (OpArrayLength, in bytes, in 64 bits) and the 32-bit offset.
+
+sirit v1.0.5 has no OpArrayLength wrapper: .patch/sirit/0001-array-length.patch
+adds one, listed in cpmfile.json, which CPMUtil applies when it extracts the
+package (the patch key makes it re-extract a cached copy). Whether the PS5
+build's sirit goes through that path is to be checked at the first build.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+---
+ .patch/sirit/0001-array-length.patch               | 28 ++++++++++++++++++++++
+ cpmfile.json                                       |  3 +++
+ .../backend/spirv/spirv_emit_context.cpp           | 14 ++++++++++-
+ 3 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/.patch/sirit/0001-array-length.patch b/.patch/sirit/0001-array-length.patch
+new file mode 100644
+index 0000000..62ea8f8
+--- /dev/null
++++ b/.patch/sirit/0001-array-length.patch
+@@ -0,0 +1,28 @@
++diff --git a/include/sirit/sirit.h b/include/sirit/sirit.h
++--- a/include/sirit/sirit.h
+++++ b/include/sirit/sirit.h
++@@ -418,6 +418,9 @@
++     /// Create a pointer into a composite object that can be used with OpLoad and OpStore.
++     Id OpAccessChain(Id result_type, Id base, std::span<const Id> indexes = {});
++
+++    /// Returns the number of elements in the structure's runtime array member.
+++    Id OpArrayLength(Id result_type, Id structure, std::uint32_t member);
+++
++     /// Create a pointer into a composite object that can be used with OpLoad and OpStore.
++     template <typename... Ts>
++     requires(...&& std::is_convertible_v<Ts, Id>) Id
++diff --git a/src/instructions/memory.cpp b/src/instructions/memory.cpp
++--- a/src/instructions/memory.cpp
+++++ b/src/instructions/memory.cpp
++@@ -34,6 +34,11 @@
++     return *code << OpId{spv::Op::OpAccessChain, result_type} << base << indexes << EndOp{};
++ }
++
+++Id Module::OpArrayLength(Id result_type, Id structure, std::uint32_t member) {
+++    code->Reserve(5);
+++    return *code << OpId{spv::Op::OpArrayLength, result_type} << structure << member << EndOp{};
+++}
+++
++ Id Module::OpVectorExtractDynamic(Id result_type, Id vector, Id index) {
++     code->Reserve(5);
++     return *code << OpId{spv::Op::OpVectorExtractDynamic, result_type} << vector << index
+diff --git a/cpmfile.json b/cpmfile.json
+index 6e55707..f1da733 100644
+--- a/cpmfile.json
++++ b/cpmfile.json
+@@ -278,6 +278,9 @@
+         "options": [
+             "SIRIT_USE_SYSTEM_SPIRV_HEADERS ON"
+         ],
++        "patches": [
++            "0001-array-length.patch"
++        ],
+         "repo": "eden-emulator/sirit",
+         "version": "v1.0.5"
+     },
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 20c76a7..f28a357 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -1025,8 +1025,20 @@ void EmitContext::DefineGlobalMemoryFunctions(const IR::Program& program) {
+                 best_index = OpSelect(U32[1], better, Const(static_cast<u32>(index)), best_index);
+             }
+             for (size_t index = 0; index < num_buffers; ++index) {
++                // Descriptor bounds are authoritative, including physical-prefix fallbacks.
++                // Check the whole access in 64 bits before access() narrows the byte offset.
++                const Id distance{OpISub(U64, addr, bases[index])};
++                const Id elements{OpArrayLength(U32[1], ssbos[index].*ssbo_member, 0U)};
++                const Id bytes{OpShiftLeftLogical(U64, OpUConvert(U64, elements), Const(shift))};
++                const Id fits{OpLogicalAnd(
++                    U1, OpULessThanEqual(U1, distance, bytes),
++                    OpUGreaterThanEqual(U1, OpISub(U64, bytes, distance),
++                                       Constant(U64, u64{1} << shift)))};
++                const Id representable{OpULessThanEqual(
++                    U1, distance, Constant(U64, (u64{1} << 32) - (u64{1} << shift)))};
++                const Id selected{OpIEqual(U1, best_index, Const(static_cast<u32>(index)))};
+                 access(index, bases[index],
+-                       OpIEqual(U1, best_index, Const(static_cast<u32>(index))));
++                       OpLogicalAnd(U1, selected, OpLogicalAnd(U1, fits, representable)));
+             }
+             return num_buffers;
+         }

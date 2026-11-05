@@ -101,6 +101,38 @@ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
                                PS5_KERNEL_PROT_GPU_WRITE) == 0;
 }''', (root/'tools/radv-host-memory.inc').read_text().strip()),
         ('   if (!placed) {', '   if (!placed) {\n      fprintf(stderr, "radv/ps5: mapping rejected result=%d address=%p bytes=%llu window32=%d\\n", result, address, (unsigned long long)bytes, window32);'),
+        # EglantinePS5: every out-of-memory ending left 60 to 240 MiB free in 100 to 450 pieces, in most
+        # runs nearly all under 2 MiB (40-53), and the pieces fallback takes only whole 2 MiB blocks, so a
+        # 16 MiB buffer was refused with 125 MiB free. When no 2 MiB block is left it now takes what
+        # there is, 16 KiB at a time: a single small buffer is placed that way already. At most
+        # RADV_PS5_MAX_CHUNKS pieces, as before. EDEN_RADV_FINE_PIECES=0 keeps the 2 MiB pieces alone.
+        ('   if (sceKernelMapDirectMemory(&address, bytes, RADV_PS5_PROTECTION, 0, physical, RADV_PS5_LARGE_BYTES) != 0)\n      return false;\n   if (address == at)',
+         '   const uint64_t grain = (((uintptr_t)at | bytes) % RADV_PS5_LARGE_BYTES) ? RADV_PS5_PAGE_BYTES : RADV_PS5_LARGE_BYTES;\n'
+         '   if (sceKernelMapDirectMemory(&address, bytes, RADV_PS5_PROTECTION, 0, physical, grain) != 0)\n      return false;\n   if (address == at)'),
+        ('''      if (sceKernelAvailableDirectMemorySize(0, pool, RADV_PS5_LARGE_BYTES, &start, &largest) != 0)
+         break;
+      const uint64_t take = MIN2(bytes - offset, (uint64_t)largest & ~(RADV_PS5_LARGE_BYTES - 1));
+      if (take == 0)
+         break;
+      int64_t physical = -1;
+      if (sceKernelAllocateDirectMemory(0, pool, take, RADV_PS5_LARGE_BYTES, RADV_PS5_DIRECT_TYPE, &physical) != 0) {''',
+         '''      uint64_t grain = RADV_PS5_LARGE_BYTES, take = 0;
+      if (sceKernelAvailableDirectMemorySize(0, pool, grain, &start, &largest) == 0)
+         take = MIN2(bytes - offset, (uint64_t)largest & ~(grain - 1));
+      if (take == 0) {
+         const char *const fine = getenv("EDEN_RADV_FINE_PIECES");
+         if (fine && fine[0] == '0')
+            break;
+         grain = RADV_PS5_PAGE_BYTES;
+         largest = 0;
+         if (sceKernelAvailableDirectMemorySize(0, pool, grain, &start, &largest) != 0)
+            break;
+         take = MIN2(bytes - offset, (uint64_t)largest & ~(grain - 1));
+      }
+      if (take == 0)
+         break;
+      int64_t physical = -1;
+      if (sceKernelAllocateDirectMemory(0, pool, take, grain, RADV_PS5_DIRECT_TYPE, &physical) != 0) {'''),
     ],
     # EglantinePS5: task/mesh draws hung the console's GPU (Mario Kart World, Zelda: Ocarina of Time).
     'src/amd/vulkan/radv_shader.c': [

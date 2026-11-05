@@ -1,0 +1,63 @@
+gpu_thread: wake for submissions during semaphore waits
+
+From viejunerd's Eglantine-PS5 patch 0041 (tag v1.219.012). next12 left it out, because
+it calls PopWaitFor, which our Common::HostCommandQueue from patch 0028 does not have:
+that was the compile error of CI run 42080309459.
+
+While a channel waits on a semaphore the GPU thread polled for 500 us and then slept 1 ms
+at a time, so a command list arriving meanwhile waited out the rest of the sleep. It now
+waits on the queue for 250 us at a time, polling the semaphores in between, because a
+release is a plain guest memory write that wakes nothing.
+
+Changed from the patch: PopWaitFor goes on HostCommandQueue instead of SPSCQueue, which
+the GPU thread no longer uses. Waits on the queue's mutex and condition variable, as
+PopWait does; TryEmplace notifies after unlocking, and the predicate is checked under
+the mutex, so no wake-up is lost.
+
+The port's rewrites of gpu_thread.cpp in headless/CMakeLists.txt do not touch this block.
+
+diff --git a/src/common/host_command_queue.h b/src/common/host_command_queue.h
+index 311666b..87427cb 100644
+--- a/src/common/host_command_queue.h
++++ b/src/common/host_command_queue.h
+@@ -80,6 +80,18 @@ public:
+         entries.pop_front();
+     }
+ 
++    /// Pops an entry, waiting at most `timeout` for one to be pushed.
++    template <typename Rep, typename Period>
++    bool PopWaitFor(T& out, const std::chrono::duration<Rep, Period>& timeout) {
++        std::unique_lock lock{mutex};
++        if (!available.wait_for(lock, timeout, [this] { return !entries.empty(); })) {
++            return false;
++        }
++        out = std::move(entries.front());
++        entries.pop_front();
++        return true;
++    }
++
+ private:
+     static long long SpinNanoseconds() {
+         static const long long value = [] {
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+index 3af8cb6..7273c28 100644
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -76,10 +76,14 @@ void ThreadManager::StartThread(VideoCore::RendererBase& renderer, Core::Fronten
+                     if (std::chrono::steady_clock::now() - last_progress <
+                         std::chrono::microseconds{500}) {
+                         std::this_thread::yield();
+-                    } else {
+-                        std::this_thread::sleep_for(std::chrono::milliseconds{1});
++                        continue;
++                    }
++                    // Then sleep until the CPU submits more work, polling the semaphores every
++                    // quarter millisecond (a release is a plain guest memory write that wakes
++                    // nothing). A fixed 1 ms sleep let new submissions wait out the rest of it.
++                    if (!state.queue.PopWaitFor(next, std::chrono::microseconds{250})) {
++                        continue;
+                     }
+-                    continue;
+                 }
+             } else {
+                 Profile::Scope scope{Profile::Zone::Idle};

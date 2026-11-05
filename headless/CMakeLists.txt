@@ -165,8 +165,12 @@ eden_fiber_replace("    to.impl->previous_fiber = weak_from.lock();"
 eden_fiber_replace("    // \"from\" might no longer be valid if the thread was killed\n    if (auto from = weak_from.lock()) {"
     "    if (auto* from = static_cast<Fiber*>(transfer.data)) {")
 if(PS5_NATIVE)
-# Native fibers keep their 2MiB usable stack, but reserve it in the CPU flexible pool.
+# Native fibers reserve their stack in the CPU flexible pool, 512 KiB of it by default: the size
+# upstream gives its other PlayStation target (__OPENORBIS__). EDEN_FIBER_STACK_KIB in env.txt sets
+# another, 2048 being the size this port used to keep (fiber_stack.h says why it matters).
 # ThreadToFiber needs only context bookkeeping and allocates no unused private stack.
+eden_fiber_replace("constexpr size_t DEFAULT_STACK_SIZE = 512 * 4096;"
+    "#define DEFAULT_STACK_SIZE (::Eden::FiberStack::StackBytes())")
 eden_fiber_replace("    std::unique_ptr<u8[]> stack;"
     "    ::Eden::FiberStack stack;")
 eden_fiber_replace("    impl->stack.reset(new u8[DEFAULT_STACK_SIZE]);\n    impl->stack_limit = impl->stack.get();"

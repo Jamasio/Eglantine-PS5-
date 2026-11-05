@@ -22,6 +22,12 @@ namespace Eden {
 // has no room (the GPU's 1 GiB table, CMakeLists.txt), and a refusal sends a stack to the heap.
 // Only whole mappings go back: part of one has never been given back on the console, and fibers are
 // made in every session.
+//
+// Each stack was 2 MiB, and the pool's 448 MiB less the app's own 140 MiB and PoolFloor is 122 such
+// stacks: past them every run put its stacks in the heap, in the direct pool (EDEN_FIBER_STACK at 128
+// allocations: 244 MiB flexible, 12 MiB fallback, runs 40-53). At 512 KiB, upstream's size for its
+// other PlayStation target, they all fit and flexible memory can shrink (sce_sys/param.json). A
+// stack in the pool overflows into its guard page, a crash at a known address, not into a neighbour.
 class FiberStack {
 public:
     FiberStack() = default;
@@ -69,6 +75,17 @@ public:
             std::fprintf(stderr, "EDEN_FIBER_STACK allocations=%llu flexible=%llu fallback=%llu stack_bytes=%zu\n",
                          count, flexible_bytes.load(), fallback_bytes.load(), bytes);
         }
+    }
+    // EDEN_FIBER_STACK_KIB (env.txt), whole guard pages, from 256 KiB to 2 MiB. Read at the first fiber,
+    // after env.txt: every stack of a run has one size, which the fiber code takes from here too.
+    static std::size_t StackBytes() noexcept {
+        static const std::size_t chosen = [] {
+            const char* const asked = std::getenv("EDEN_FIBER_STACK_KIB");
+            const std::size_t kib = asked ? std::strtoull(asked, nullptr, 10) : 512;
+            const std::size_t size = (kib << 10) / GuardBytes * GuardBytes;
+            return size < (std::size_t{256} << 10) || size > (std::size_t{2} << 20) ? std::size_t{512} << 10 : size;
+        }();
+        return chosen;
     }
     unsigned char* data() noexcept { return base; }
     std::size_t size() const noexcept { return bytes; }
