@@ -56,25 +56,30 @@ replace('''                    (double)period / 1e6);
 replace('   wsi->base.get_support =', '   videoout_ref();\n\n   wsi->base.get_support =')
 replace('   if (wsi)\n      vk_free(alloc, wsi);',
         '   if (wsi) {\n      videoout_unref();\n      vk_free(alloc, wsi);\n      wsi_device->wsi[VK_ICD_WSI_PLATFORM_DISPLAY] = NULL;\n   }')
-if sys.argv[1:2] == ['--check']:
-    # Is the driver that was built (its recorded display source, EDEN_WSI_SHA256) this adaptation?
-    recorded = Path(sys.argv[2]).read_text().split()[0] if Path(sys.argv[2]).is_file() else ''
-    sys.exit(0 if recorded == hashlib.sha256(text.encode()).hexdigest() else 1)
-changed = not target.exists() or target.read_text() != text
-if changed:
-    target.write_text(text)
-    # Upstream caches the whole build by pin. Invalidate only that receipt;
-    # Ninja retains all unchanged objects and rebuilds the patched WSI.
-    provenance = root.parent/'mihawk-vulkan-review/.deps/native/radv-release/PROVENANCE.txt'
-    if provenance.exists():
-        provenance.replace(provenance.with_suffix('.base.txt'))
-print(f'RADV WSI adaptation changed={changed} sha256={hashlib.sha256(text.encode()).hexdigest()}')
-
 # Preserve the reason behind RADV's successful-but-empty device enumeration.
 # These startup-only diagnostics avoid repeated full game runs for each stage.
-for relative, replacements in {
+DRIVER_ADAPTATIONS = {
     # Restore the pinned upload path: explicit CPU flush did not affect HUD corruption.
-    'src/amd/vulkan/radv_cmd_buffer.c': [],
+    'src/amd/vulkan/radv_cmd_buffer.c': [
+        # EglantinePS5: no stream split inside an emulated task draw. Its chunks' records prepass
+        # is a dispatch (radv_before_dispatch splits), after which the chunk's mesh draw went out
+        # without the graphics state the split reset. The split stays due and falls before the
+        # next draw or dispatch outside the task draw (about 512K words of headroom are left).
+        ('static void\nradv_split_cmd_stream_if_due(struct radv_cmd_buffer *cmd_buffer)\n{',
+         'static _Thread_local unsigned radv_task_emu_depth;\n\nstatic void\nradv_split_cmd_stream_if_due(struct radv_cmd_buffer *cmd_buffer)\n{'),
+        ('   if (likely(!device->ws->cs_split_due) || !device->ws->cs_split_due(cs->b))\n      return;',
+         '   if (likely(!device->ws->cs_split_due) || !device->ws->cs_split_due(cs->b))\n      return;\n   if (radv_task_emu_depth)\n      return;'),
+        ('static void\nradv_task_emu_draw_direct(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z)\n{',
+         'static void\nradv_task_emu_draw_direct_body(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z);\n\n'
+         'static void\nradv_task_emu_draw_direct(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z)\n{\n'
+         '   radv_task_emu_depth++;\n   radv_task_emu_draw_direct_body(cmd_buffer, x, y, z);\n   radv_task_emu_depth--;\n}\n\n'
+         'static void\nradv_task_emu_draw_direct_body(struct radv_cmd_buffer *cmd_buffer, uint32_t x, uint32_t y, uint32_t z)\n{'),
+        ('static void\nradv_task_emu_draw_indirect(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info)\n{',
+         'static void\nradv_task_emu_draw_indirect_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info);\n\n'
+         'static void\nradv_task_emu_draw_indirect(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info)\n{\n'
+         '   radv_task_emu_depth++;\n   radv_task_emu_draw_indirect_body(cmd_buffer, info);\n   radv_task_emu_depth--;\n}\n\n'
+         'static void\nradv_task_emu_draw_indirect_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info)\n{'),
+    ],
     'src/amd/vulkan/radv_physical_device.c': [
         ('   if (result == VK_ERROR_INCOMPATIBLE_DRIVER || result == VK_ERROR_INITIALIZATION_FAILED)\n      return VK_SUCCESS;',
          '   if (result != VK_SUCCESS) fprintf(stderr, "radv/ps5: physical device creation result=%d\\n", result);\n   if (result == VK_ERROR_INCOMPATIBLE_DRIVER || result == VK_ERROR_INITIALIZATION_FAILED)\n      return VK_SUCCESS;'),
@@ -97,7 +102,58 @@ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
 }''', (root/'tools/radv-host-memory.inc').read_text().strip()),
         ('   if (!placed) {', '   if (!placed) {\n      fprintf(stderr, "radv/ps5: mapping rejected result=%d address=%p bytes=%llu window32=%d\\n", result, address, (unsigned long long)bytes, window32);'),
     ],
-}.items():
+    # EglantinePS5: task/mesh draws hung the console's GPU (Mario Kart World, Zelda: Ocarina of Time).
+    'src/amd/vulkan/radv_shader_info.c': [
+        # Parts of whole primitives that fit one NGG subgroup's 256 vertices: 256 triangles are
+        # 4 parts of 64, not 3 of 86 (258 vertices). ac_nir_lower_ngg_mesh derives each part's
+        # primitives from this count (part_prims = DIV_ROUND_UP(max_primitives, prim_parts)).
+        ('   return MAX2(DIV_ROUND_UP(nir->info.mesh.max_primitives_out * vertices_per_prim, 256), 1);',
+         '   return MAX2(DIV_ROUND_UP(nir->info.mesh.max_primitives_out, 256 / vertices_per_prim), 1);'),
+    ],
+    'src/amd/common/nir/ac_nir_lower_ngg_mesh.c': [
+        # The publish wait gives up after about a second instead of spinning for ever: a wrong
+        # count then shows as wrong primitives, not as a lost device.
+        ('''      nir_loop *loop = nir_push_loop(b);
+      {
+         nir_def *header = nir_build_load_global(b, 1, 32, s->header_addr, .align_mul = 4,
+                                                 .access = ACCESS_COHERENT | ACCESS_VOLATILE);
+         nir_break_if(b, nir_ult_imm(b, nir_isub(b, header, first), count));
+         ac_nir_sleep(b, 64);
+      }
+      nir_pop_loop(b, loop);''',
+         '''      nir_variable *spins = nir_local_variable_create(b->impl, glsl_uint_type(), "ms_publish_spins");
+      nir_store_var(b, spins, nir_imm_int(b, 0), 0x1);
+      nir_loop *loop = nir_push_loop(b);
+      {
+         nir_def *header = nir_build_load_global(b, 1, 32, s->header_addr, .align_mul = 4,
+                                                 .access = ACCESS_COHERENT | ACCESS_VOLATILE);
+         nir_break_if(b, nir_ult_imm(b, nir_isub(b, header, first), count));
+         nir_def *spun = nir_iadd_imm(b, nir_load_var(b, spins), 1);
+         nir_store_var(b, spins, spun, 0x1);
+         nir_break_if(b, nir_uge(b, spun, nir_imm_int(b, 1 << 18)));
+         ac_nir_sleep(b, 64);
+      }
+      nir_pop_loop(b, loop);'''),
+    ],
+}
+# The driver is rebuilt when the WSI text's hash changes (--check, tools/prepare-build.sh): the
+# driver adaptations' digest goes into that text as a comment, so a change to them rebuilds it too.
+text += '\n/* EglantinePS5 driver adaptations: ' + hashlib.sha256(repr(sorted(DRIVER_ADAPTATIONS.items())).encode()).hexdigest() + ' */\n'
+if sys.argv[1:2] == ['--check']:
+    # Is the driver that was built (its recorded display source, EDEN_WSI_SHA256) this adaptation?
+    recorded = Path(sys.argv[2]).read_text().split()[0] if Path(sys.argv[2]).is_file() else ''
+    sys.exit(0 if recorded == hashlib.sha256(text.encode()).hexdigest() else 1)
+changed = not target.exists() or target.read_text() != text
+if changed:
+    target.write_text(text)
+    # Upstream caches the whole build by pin. Invalidate only that receipt;
+    # Ninja retains all unchanged objects and rebuilds the patched WSI.
+    provenance = root.parent/'mihawk-vulkan-review/.deps/native/radv-release/PROVENANCE.txt'
+    if provenance.exists():
+        provenance.replace(provenance.with_suffix('.base.txt'))
+print(f'RADV WSI adaptation changed={changed} sha256={hashlib.sha256(text.encode()).hexdigest()}')
+
+for relative, replacements in DRIVER_ADAPTATIONS.items():
     original = root.parent/'mihawk-mesa-review'/relative
     destination = root.parent/'mihawk-vulkan-review/.deps/work/radv-src'/relative
     adapted = original.read_text()

@@ -1,0 +1,61 @@
+vk_texture_cache: decode large ASTC on the CPU instead of through a full-size RGBA8 image
+
+TranscodeAstcToBcn (ASTC -> BC1/BC3 on the GPU) decodes into an RGBA8 storage
+image with every level and layer of the texture (VkFormat 51). It then keeps
+that image for reuse. In Ocarina of Time a 1365x1365x90 array with 11 levels
+needs an 853 MiB decode image next to its 213 MiB BC3 image, and 6144x6144
+textures need 201 MiB each. The PS5 ran out of memory with a 34 MiB largest free
+block. ASTC images whose decode image would exceed EDEN_NX2_GPU_TRANSCODE_MIB
+(default 128 MiB; 0 = no limit) now take the asynchronous CPU decode to the same
+BC format, which needs no full-size scratch image. Smaller textures keep the GPU
+transcode.
+
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 6501a2c15b..cac4397b68 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -311,11 +311,31 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
+     return HugeAstcHostFormat(device, info);
+ }
+ 
++// Whether TranscodeAstcToBcn's RGBA8 decode image (every level and layer of `info`, four bytes a
++// texel) would exceed EDEN_NX2_GPU_TRANSCODE_MIB (default 128 MiB). Ocarina of Time's
++// 1365x1365x90 arrays needed 853 MiB decode images next to their 213 MiB BC3 images, and
++// 6144x6144 ones 201 MiB, which ran the PS5 out of memory. Those decode on the CPU instead
++// (asynchronously, to the same BC1/BC3), which needs no full-size scratch image.
++[[nodiscard]] bool TranscodeScratchTooLarge(const ImageInfo& info) {
++    static const u64 limit = [] {
++        const char* value = std::getenv("EDEN_NX2_GPU_TRANSCODE_MIB");
++        const u64 mib = value != nullptr ? std::strtoull(value, nullptr, 10) : 128;
++        return mib != 0 ? mib << 20 : ~u64{0};
++    }();
++    u64 bytes = 0;
++    for (s32 level = 0; level < info.resources.levels; ++level) {
++        bytes += u64{(std::max)(info.size.width >> level, 1U)} *
++                 (std::max)(info.size.height >> level, 1U) * 4;
++    }
++    return bytes * static_cast<u64>(info.resources.layers) > limit;
++}
++
+ // ASTC that the GPU decodes and re-compresses to BC1/BC3 itself (TranscodeAstcToBcn): no CPU
+ // decode, so streamed textures are ready the frame they are first used instead of seconds later.
+ [[nodiscard]] bool WillUseGpuBcnTranscode(const Device& device, const ImageInfo& info) {
+     if (!IsPixelFormatASTC(info.format) || device.IsOptimalAstcSupported() ||
+-        IsHugeAstcArray(device, info) || info.type != ImageType::e2D || info.size.depth != 1) {
++        IsHugeAstcArray(device, info) || info.type != ImageType::e2D || info.size.depth != 1 ||
++        TranscodeScratchTooLarge(info)) {
+         return false;
+     }
+     return Settings::values.accelerate_astc.GetValue() == Settings::AstcDecodeMode::Gpu &&
+@@ -2669,6 +2689,10 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+             if (WillUseAcceleratedAstcDecode(runtime->device, info) ||
+                 WillUseGpuBcnTranscode(runtime->device, info)) {
+                 flags |= VideoCommon::ImageFlagBits::AcceleratedUpload;
++            } else if (Settings::GetAstcRecompression() != Settings::AstcRecompression::Uncompressed &&
++                       TranscodeScratchTooLarge(info)) {
++                // Too large for the GPU transcode's scratch image: decode on the CPU, off the GPU thread.
++                flags |= VideoCommon::ImageFlagBits::AsynchronousDecode;
+             }
+             break;
+         case Settings::AstcDecodeMode::CpuAsynchronous:
+
