@@ -96,7 +96,7 @@
  * with junk in the GPU's command stream; with EDEN_HEAP_KEEP_ARENAS run 55 did not. So an empty
  * arena is destroyed before it goes back to its space, and a space before its memory goes back
  * to the system (both paths first ran on the console in run 54). Where the SDK has no
- * sceLibcMspaceDestroy (a weak import), nothing is destroyed and the kernel log says so once.
+ * sceLibcMspaceDestroy (a weak import), nothing goes back and the kernel log says so once.
  */
 #include <pthread.h>
 #include <stdio.h>
@@ -217,15 +217,19 @@ int sceKernelUsleep(unsigned int microseconds);
 int sceLibcMspaceDestroy(void *mspace) __attribute__((weak));
 int sceKernelDebugOutText(int channel, const char *text);
 
-/* Takes an mspace out of libc's books before its memory is used for anything else. */
-static void eden_heap_destroy_mspace(void *mspace) {
-  if (sceLibcMspaceDestroy != NULL) {
-    sceLibcMspaceDestroy(mspace);
-    return;
-  }
+/* Takes an mspace out of libc's books before its memory is used for anything else. Returns 0 when
+ * libc still knows it: its memory must then stay as it is, or libc writes into whatever comes next. */
+static int eden_heap_destroy_mspace(void *mspace) {
   static atomic_int reported;
-  if (atomic_fetch_add_explicit(&reported, 1, memory_order_relaxed) == 0)
-    sceKernelDebugOutText(0, "EDEN_HEAP sceLibcMspaceDestroy is not in this SDK: mspaces given back stay known to libc\n");
+  if (sceLibcMspaceDestroy == NULL) {
+    if (atomic_fetch_add_explicit(&reported, 1, memory_order_relaxed) == 0)
+      sceKernelDebugOutText(0, "EDEN_HEAP sceLibcMspaceDestroy is not in this SDK: mspaces and their memory stay\n");
+    return 0;
+  }
+  const int result = sceLibcMspaceDestroy(mspace);
+  if (result != 0 && atomic_fetch_add_explicit(&reported, 1, memory_order_relaxed) == 0)
+    sceKernelDebugOutText(0, "EDEN_HEAP sceLibcMspaceDestroy refused: mspaces and their memory stay\n");
+  return result == 0;
 }
 
 /* Arena creation is rare (once per thread) but runs under a spin flag, and its holder also takes
@@ -268,7 +272,7 @@ static void eden_heap_use_arena(struct eden_heap_thread *self, void *arena);
 
 /* Empty arenas stay with their records, as they did before (EDEN_HEAP_KEEP_ARENAS). */
 static int eden_heap_keeps_arenas(void) {
-  return getenv("EDEN_HEAP_KEEP_ARENAS") != NULL;
+  return sceLibcMspaceDestroy == NULL || getenv("EDEN_HEAP_KEEP_ARENAS") != NULL;
 }
 
 /* Per-thread allocation statistics. The live/peak/block counters are process-wide atomics, and
@@ -813,7 +817,10 @@ size_t eden_heap_trim(void) {
     /* Nothing can reach the space now (retired, no user, no block): out of libc's books before its
      * memory goes. A space kept after all (heap_return=off) is made again over the same memory. */
     void *const space = atomic_load_explicit(&eden_heap_spaces[slot], memory_order_acquire);
-    eden_heap_destroy_mspace(space);
+    if (!eden_heap_destroy_mspace(space)) {
+      atomic_store_explicit(&eden_heap_space_retired[slot], 0, memory_order_seq_cst);
+      continue;
+    }
     const int done = eden_heap_decommit(start, size);
     if (done == 0) {
       /* Kept as it was (dev-settings heap_return=off, or nothing to give back): usable again. */
@@ -977,8 +984,13 @@ static void eden_heap_return_record(struct eden_heap_thread *record, int ended) 
     /* No block is in it and no thread is on it: nothing can take from it or free into it now.
      * Out of the slot's and the list's tables first, then out of libc's, then its memory to its
      * space. */
+    void *const slot_arena = atomic_load_explicit(&eden_heap_slots[eden_heap_slot(block)], memory_order_relaxed);
     atomic_store_explicit(&eden_heap_slots[eden_heap_slot(block)], NULL, memory_order_release);
-    eden_heap_destroy_mspace(arena);
+    if (!eden_heap_destroy_mspace(arena)) {
+      atomic_store_explicit(&eden_heap_slots[eden_heap_slot(block)], slot_arena, memory_order_release);
+      ++i;
+      continue;
+    }
     eden_heap_arena_list[index] = NULL;
     atomic_store_explicit(&eden_heap_arena_blocks_probe[index], NULL, memory_order_relaxed);
     atomic_fetch_add_explicit(&eden_heap_arena_holes, 1, memory_order_relaxed);
