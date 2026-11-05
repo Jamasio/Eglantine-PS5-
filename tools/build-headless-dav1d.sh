@@ -45,4 +45,10 @@ else
 fi
 ninja -C "$build/build" -j"${EDEN_BUILD_JOBS:-$(nproc)}"
 meson install -C "$build/build" --quiet
+# Meson puts .pc files in libdata/pkgconfig on a FreeBSD host; FFmpeg's configure looks in lib/pkgconfig.
+find "$prefix" -name 'dav1d*' -o -name 'libdav1d*'
+if [[ -f "$prefix/libdata/pkgconfig/dav1d.pc" ]]; then
+    mkdir -p "$prefix/lib/pkgconfig"
+    cp "$prefix/libdata/pkgconfig/dav1d.pc" "$prefix/lib/pkgconfig/dav1d.pc"
+fi
 test -f "$prefix/lib/libdav1d.a" && test -f "$prefix/lib/pkgconfig/dav1d.pc"
