@@ -540,6 +540,9 @@ int main(int argc, char** argv) {
                                           std::pair{"EDEN_NX2_UNBACKED_LIMIT", "0"}}) {
             setenv(name, value, 0);
         }
+        // The texture collector decides from the pool's shortness as it did (performance.h).
+        if (const char* const pool = std::getenv("EDEN_NX2_TC_POOL_PRESSURE"); pool && pool[0] == '1')
+            Eden::Performance::texture_usage_from_images = false;
 #ifdef EDEN_MKW_DIAGNOSTICS
         // Temporary capture for the Mario Kart World loading-screen investigation.
         const auto diagnostic_capture_dir = Eden::LogFile("mkw-gpfifo-" + std::to_string(getpid()));

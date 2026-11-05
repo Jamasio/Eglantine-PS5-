@@ -608,6 +608,7 @@ void MemoryAllocator::SetRefusalHook(RefusalHook hook, void* context) noexcept {
 u64 MemoryAllocator::ReleaseRefused(const char* why, u64 wanted) const {
     const auto hook = refusal_hook.load(std::memory_order_acquire);
     const u64 staging = hook ? hook(refusal_context, true) : 0;
+    ::Eden::Performance::graphics_refusals.fetch_add(1, std::memory_order_relaxed);
     const u64 heap = ::Eden::Performance::TrimHeap(why);
     // Nothing the caches hold gets a session past this moment: an image the collector deletes keeps
     // its memory until the next frame at the earliest. The guest's reserve is memory the pool can have
@@ -1157,6 +1158,37 @@ gc_begin = download_source.index('void TextureCache<P>::RunGarbageCollector() {'
 gc_end = download_source.index('\ntemplate <class P>', gc_begin)
 gc_original = download_source[gc_begin:gc_end]
 gc = gc_original
+POOL_PRESSURE = r'''    const auto PoolPressure = [this]() -> int {
+        if constexpr (!std::is_same_v<Runtime, Vulkan::TextureCacheRuntime>) {
+            return 0;
+        } else {
+            if (!::Eden::Performance::texture_usage_from_images.load(std::memory_order_relaxed)) {
+                return 0;
+            }
+            static const u64 short_bytes = [] {
+                const char* value = std::getenv("EDEN_NX2_TC_POOL_SHORT_MIB");
+                return (value != nullptr ? std::strtoull(value, nullptr, 10) : 1024ULL) << 20;
+            }();
+            static const u64 critical_bytes = [] {
+                const char* value = std::getenv("EDEN_NX2_TC_POOL_CRITICAL_MIB");
+                return (value != nullptr ? std::strtoull(value, nullptr, 10) : 256ULL) << 20;
+            }();
+            static unsigned long long refusals_seen = 0;
+            static u64 refusal_frame = 0;
+            const auto refusals = ::Eden::Performance::graphics_refusals.load(std::memory_order_relaxed);
+            if (refusals != refusals_seen) {
+                refusals_seen = refusals;
+                refusal_frame = frame_tick;
+            }
+            const auto free_memory = ::Eden::Performance::graphics_memory_free.load(std::memory_order_relaxed);
+            const u64 free_bytes = free_memory ? free_memory() : ~u64{0};
+            if ((refusal_frame != 0 && frame_tick - refusal_frame < 120) || free_bytes < critical_bytes) {
+                return 2;
+            }
+            return free_bytes < short_bytes ? 1 : 0;
+        }
+    };
+'''
 gc_setup = '''    const auto ReclaimedBytes = [&](const Image& image) {
         u64 bytes = 0;
 ''' + reclaimed_bytes + '''        return bytes;
@@ -1197,6 +1229,29 @@ for old, new in [
     # (Ocarina of Time's 288 MiB depth image: 576 MiB more at that moment, 288 MiB for good).
     ('(!high_priority_mode && must_download)) {',
      '(!DirtyEvictions() && must_download) ||\n            (must_download && image.unswizzled_size_bytes >= 128_MiB)) {'),
+    # The pool's shortness as a signal of its own (performance.h texture_usage_from_images), beside
+    # what the images add up to: a refusal in the last 120 frames or the largest free block under
+    # EDEN_NX2_TC_POOL_CRITICAL_MIB (256) is level 2, collected as past "critical" (images unused
+    # for 10 frames go); under EDEN_NX2_TC_POOL_SHORT_MIB (1024, the pool's own "short" mark) level
+    # 1, as past "expected" (unused for 25 frames). Run 58 (marks raised to 7000/8000, nothing
+    # evicted) held 1058 unused images, 1879 MiB, when the pool refused at 99 s, 20 s after the
+    # largest free block fell under 1 GiB: evicting what is unused is what keeps a session alive, so
+    # the signal must fire there; images used in the last 10 to 25 frames stay. With the pool
+    # figure (EDEN_NX2_TC_POOL_PRESSURE=1) the level is 0 and the marks decide alone, as before.
+    ('    bool high_priority_mode = false;\n    bool aggressive_mode = false;\n    bool evict_old_costly = false;\n',
+     '    bool high_priority_mode = false;\n    bool aggressive_mode = false;\n    bool evict_old_costly = false;\n'
+     + POOL_PRESSURE),
+    ('        high_priority_mode = total_used_memory >= expected_memory;\n'
+     '        aggressive_mode = allow_aggressive && total_used_memory >= critical_memory;',
+     '        const int pressure = PoolPressure();\n'
+     '        high_priority_mode = total_used_memory >= expected_memory || pressure >= 1;\n'
+     '        aggressive_mode = allow_aggressive && (total_used_memory >= critical_memory || pressure >= 2);'),
+    ('        if (aggressive_mode && total_used_memory < critical_memory) {',
+     '        if (aggressive_mode && total_used_memory < critical_memory && PoolPressure() < 2) {'),
+    ('        } else if (high_priority_mode && total_used_memory < expected_memory) {',
+     '        } else if (high_priority_mode && total_used_memory < expected_memory && PoolPressure() < 1) {'),
+    ('    if (total_used_memory >= critical_memory) {\n        Configure(true);',
+     '    if (total_used_memory >= critical_memory || PoolPressure() >= 2) {\n        Configure(true);'),
     ('    Configure(false);', '    Configure(false);\n    PrefetchDownloads();'),
     ('        Configure(true);', '        Configure(true);\n        PrefetchDownloads();'),
 ]:
@@ -1234,6 +1289,8 @@ for signature, index in (
 adapt('src/video_core/texture_cache/texture_cache.h',
       'vulkan-cache/video_core/texture_cache/texture_cache.h', [
     ('namespace VideoCommon {', '#include "performance.h"\n#include "common/scope_exit.h"\nnamespace Vulkan { class TextureCacheRuntime; }\n\nnamespace VideoCommon {'),
+    ('    // If we can obtain the memory info, use it instead of the estimate.\n    if (runtime.CanReportMemoryUsage()) {',
+     "    // The console: the images' own memory (performance.h texture_usage_from_images), the figure\n    // Eden keeps itself when the driver gives none, set right every 300 frames from the images there\n    // are (scaled ones hold their original too, as the collector counts them).\n    const bool from_images = std::is_same_v<Runtime, Vulkan::TextureCacheRuntime> &&\n                             ::Eden::Performance::texture_usage_from_images.load(std::memory_order_relaxed);\n    if (from_images && frame_tick % 300 == 0) {\n        u64 held = 0;\n        for (const auto [image_id, image] : slot_images) {\n            held += ImageMemoryBytes(*image) + (image->HasScaled() ? GetScaledImageSizeBytes(*image) : 0);\n        }\n        total_used_memory = held;\n    }\n    // If we can obtain the memory info, use it instead of the estimate.\n    if (runtime.CanReportMemoryUsage() && !from_images) {"),
     (download_prefix, download_prefix + (port / 'vulkan_download_batch.inc').read_text() + '\n'),
     (gc_original, gc),
     # RADV reports all Vulkan allocations, not just cached textures. A game's

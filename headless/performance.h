@@ -408,6 +408,21 @@ inline std::atomic<unsigned long long (*)()> guest_kernel_memory{nullptr};
 // the driver's count.
 inline std::atomic<unsigned long long (*)()> graphics_memory_free{nullptr};
 inline std::atomic<bool> graphics_usage_from_pool{true};
+// The texture cache's "memory in use" (tools/prepare-vulkan-port.py, texture_cache.h): the host
+// memory of its images, added up as they come and go, instead of the pool figure above. That figure
+// is the pool's shortness, not the images' size: with the guest at 5-6 GiB it read about 6100 MiB
+// against marks of 3584 and 4096, so the collector sat in aggressive mode and deleted 2000+ images
+// (1800 of them copied back to guest memory first) every 600 frames while the images held 1600
+// (run 57). The pool's shortness reaches the collector as a signal of its own instead
+// (graphics_refusals and graphics_memory_free; the collector's PoolPressure): images unused for
+// 25 frames go while the largest free block is under 1 GiB, for 10 frames under 256 MiB or after
+// a refusal; images in use stay. Run 58 (marks raised, nothing evicted) died 20 s after the pool
+// went short with 1879 MiB of images unused for 10 frames: the eviction is what keeps a session
+// alive, the churn of images in use is what costs it.
+// EDEN_NX2_TC_POOL_PRESSURE=1 in env.txt keeps the pool figure.
+inline std::atomic<bool> texture_usage_from_images{true};
+// Allocations the pool refused since the app started (vulkan_memory_allocator.cpp, ReleaseRefused).
+inline std::atomic<unsigned long long> graphics_refusals{0};
 // GPU thread only (the collector).
 inline bool KeepDirtyTextures() {
     if (!gc_keep_dirty.load(std::memory_order_relaxed)) return false;
