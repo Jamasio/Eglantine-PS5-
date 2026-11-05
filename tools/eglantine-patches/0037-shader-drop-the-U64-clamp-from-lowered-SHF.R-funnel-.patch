@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: zortos293 <65777760+zortos293@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 00:38:18 +0000
+Subject: [PATCH] shader: drop the U64 clamp from lowered SHF.R funnel
+ immediates
+
+The Maxwell translator reads bits 20-38 of SHF.R imm as the shift, so the
+U64 max-shift bit made every lowered SHF.R.U64 shift by 63 (Ocarina vertex
+shader 1a55fa57a335b963 returned bit 63 instead of a 21-bit field).
+
+Ported from zortos293/Lichii fix/oot-bloom 4435506c96 without its test
+file (not in this tree); checked by a field test in ampere_lowering.cpp.
+In game it lowers Ocarina's gameplay brightness (mean 0.89 -> 0.82) but
+the bloom stays.
+
+Co-authored-by: zortos293 <65777760+zortos293@users.noreply.github.com>
+Assisted-by: Claude Opus 5.5 (ported the fix, wrote the test, ran the in-game check)
+(cherry picked from commit 223c752f442b2f8d11f703588fe5130c0faa8d10)
+---
+ .../frontend/ampere/lower_to_maxwell.h          |  5 +++--
+ src/tests/video_core/ampere_lowering.cpp        | 17 +++++++++++++++++
+ 2 files changed, 20 insertions(+), 2 deletions(-)
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index 985a52c3db..be1448aee2 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -2953,9 +2953,10 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+             const bool is_signed = insn.Bits(73, 2) == 2;
+             if (!insn.Bits(80, 1) && insn.Bits(76, 1) && insn.Bits(73, 2) == 1 &&
+                 !insn.Bits(75, 1) && insn.words[1] <= 32) {
++                // SHF.R.U64 funnel: the translator reads bits 20-38 as the immediate, so the U64
++                // clamp (bit 38) would turn every shift into 63; shifts up to 32 need no clamp.
+                 emit(base(0x38f8000000000000ULL) | (u64{insn.Bits(24, 8)} << 8) |
+-                     (u64{insn.words[1]} << 20) | (u64{2} << 37) |
+-                     (u64{insn.Bits(64, 8)} << 39));
++                     (u64{insn.words[1]} << 20) | (u64{insn.Bits(64, 8)} << 39));
+                 break;
+             }
+             if (!insn.Bits(80, 1) && !insn.Bits(76, 1) && insn.Bits(64, 8) == 255 &&
+diff --git a/src/tests/video_core/ampere_lowering.cpp b/src/tests/video_core/ampere_lowering.cpp
+index 0ea19ad9a6..21b9512d0b 100644
+--- a/src/tests/video_core/ampere_lowering.cpp
++++ b/src/tests/video_core/ampere_lowering.cpp
+@@ -102,6 +102,23 @@ TEST_CASE("Ampere SUST.P keeps its channel mask", "[video_core][ampere]") {
+     REQUIRE(((FindMaxwell(lowered, 0xeb2, 52) >> 20) & 0xf) == 1);
+ }
+ 
++TEST_CASE("Ampere SHF.R.U64 immediate shifts keep their amount", "[video_core][ampere]") {
++    // SHF.R.U64 R14, R14, n, R17 (Ocarina vertex shader 1a55fa57a335b963). The Maxwell
++    // translator reads the immediate from bits 20-38, so no max-shift bits may be set there.
++    for (const u32 shift : {0U, 1U, 21U, 31U, 32U}) {
++        const std::array<Instruction, 2> code{{
++            {{0x0e0e7819, shift, 0x00001211, 0x020fe200}},
++            EXIT,
++        }};
++        const auto lowered = LowerToMaxwell(code);
++        REQUIRE(static_cast<bool>(lowered));
++        const u64 shf = FindMaxwell(lowered, 0x38f8, 48);
++        REQUIRE(shf != 0);
++        CHECK(((shf >> 20) & 0x7ffff) == shift);
++        CHECK(((shf >> 39) & 0xff) == 17);
++    }
++}
++
+ TEST_CASE("Ampere SHFL with a register lane keeps its mode", "[video_core][ampere]") {
+     // SHFL.DOWN PT, R7, R0, R5, 0x1f
+     const std::array<Instruction, 2> code{{

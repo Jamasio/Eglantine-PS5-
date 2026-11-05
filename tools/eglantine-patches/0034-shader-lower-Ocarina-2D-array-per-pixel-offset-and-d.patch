@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: kraibse <33869366+kraibse@users.noreply.github.com>
+Date: Thu, 5 Nov 2026 01:33:31 +0100
+Subject: [PATCH] shader: lower Ocarina 2D array, per-pixel offset and depth
+ gathers
+
+TLD4 accepted only plain 2D gathers with an optional AOFFI. Ocarina also
+gathers from 2D arrays, with per-pixel offsets (bits 76-77 = 2) and with
+a depth reference (bit 78). The source lists follow Mesa NAK: Ra holds
+the coordinates with the array index first, Rb the offsets and then the
+reference, and with nothing for Rb the coordinates split evenly across
+both. Maxwell TLD4 reads the same lists, so the lowering copies them into
+its coordinate and meta registers and sets the type, PTP and DC fields.
+
+FMUL and FADD in register form get shadow operands for high registers.
+
+Assisted-by: Claude Opus 5.5 (decoded the rejections from the log, wrote the lowering and tests)
+(cherry picked from commit f1a5c6e04fbce7250b92e82d51291821a59f9f36)
+---
+ .../frontend/ampere/lower_to_maxwell.h        | 45 +++++++++++-------
+ src/tests/video_core/ampere_lowering.cpp      | 46 +++++++++++++++++++
+ 2 files changed, 75 insertions(+), 16 deletions(-)
+
+diff --git a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+index 72a46a1eed..6cdf7e2707 100644
+--- a/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
++++ b/src/shader_recompiler/frontend/ampere/lower_to_maxwell.h
+@@ -80,6 +80,7 @@ inline RegisterPressure PrepareRegisterPressure(const Instruction& input, u32 re
+     case 0x805: operand(16, 2); break;
+     case 0x308: operand(16); operand(32); break;
+     case 0x433: case 0x633: operand(16); operand(24); break;
++    case 0x220: case 0x221: operand(16); operand(24); operand(32); break;
+     case 0x233: operand(16); operand(24); operand(32); break;
+     case 0xa20: case 0x621: case 0x808: case 0x923: operand(16); operand(24); break;
+     case 0x209: operand(16); operand(24); operand(32); break;
+@@ -2254,31 +2255,43 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+             }
+             break;
+         }
+-        case 0xb63: case 0xf63: { // TLD4 (gather), 2D without offsets or depth compare; component at bits 87-88.
++        case 0xb63: case 0xf63: { // TLD4 (gather), 2D or 2D array; component at bits 87-88.
+             // 0xf63: the handle in a uniform register (bit 91), Maxwell TLD4.B with the handle in Rb.
+             const bool bindless = opcode == 0xf63;
+             const u32 handle = bindless ? uniform_register(insn.Bits(40, 6)) : 255;
+             const u32 mask = insn.Bits(72, 4), second_dest = insn.Bits(64, 8);
+             const u32 source_a = insn.Bits(24, 8), source_b = insn.Bits(32, 8);
+             const u32 binding = insn.Bits(54, 5);
+-            // Bit 76: a texel offset after the coordinates (x, y in Ra, Ra+1, offsets in Rb, as
+-            // for TEX); Maxwell TLD4 takes it as AOFFI (bits 54-55) from Rb.
+-            const bool offsets = insn.Bits(76, 1) != 0;
+-            if (insn.Bits(61, 3) != 1 || insn.Bits(77, 3) || insn.Bits(81, 3) != 7 || insn.Bits(59, 1) ||
+-                (offsets && (bindless || source_b == 255 || (source_a != 255 && source_a >= 245))) ||
++            // Dimension 5: 2D array. Bits 76-77: AOFFI (1, one packed offset) or per-pixel offsets
++            // (2, two words), bit 78: depth compare. As in Mesa NAK, Ra holds the coordinates (the
++            // array index first) and Rb the offsets and then the depth reference; with nothing for
++            // Rb the coordinate list splits evenly across them. Maxwell TLD4 takes the same lists.
++            const bool array = insn.Bits(61, 3) == 5;
++            const u32 offset_mode = insn.Bits(76, 2);
++            const bool depth = insn.Bits(78, 1) != 0;
++            const u32 coordinates = array ? 3U : 2U;
++            const u32 meta = (offset_mode == 1 ? 1U : offset_mode == 2 ? 2U : 0U) + (depth ? 1U : 0U);
++            const u32 in_a = meta ? coordinates : (coordinates + 1) / 2;
++            const u32 in_b = meta ? meta : coordinates - in_a;
++            if ((insn.Bits(61, 3) != 1 && !array) || offset_mode == 3 || insn.Bits(79, 1) ||
++                insn.Bits(81, 3) != 7 || insn.Bits(59, 1) ||
++                (bindless && (offset_mode || depth || array)) ||
++                (offset_mode && source_b == 255) ||
++                (source_a != 255 && source_a + in_a > 246) || (source_b != 255 && source_b + in_b > 246) ||
+                 insn.Bits(89, 1) || mask == 0 ||
+                 (bindless ? (handle >= 246 || insn.Bits(46, 13) || !insn.Bits(91, 1))
+                           : (insn.Bits(40, 14) > 0x1fff || binding >= 18 ||
+                              (result.required_texture_buffer != ~0U && result.required_texture_buffer != binding))))
+                 return fail(index, "native texture gather mode");
+             if (!bindless) result.required_texture_buffer = binding;
+-            // Two coordinates: x in Ra, y in Rb (the coordinate list splits evenly across them);
+-            // with an offset, x and y in Ra, Ra+1 and the offset in Rb.
+-            const u32 y = !offsets ? source_b : source_a == 255 ? 255U : source_a + 1;
+-            emit(0x5c98000000000000ULL | predicate | 250 | (u64{15} << 39) | (u64{source_a} << 20));
+-            emit(0x5c98000000000000ULL | predicate | 251 | (u64{15} << 39) | (u64{y} << 20));
+-            if (offsets) {
+-                emit(0x5c98000000000000ULL | predicate | 246 | (u64{15} << 39) | (u64{source_b} << 20));
++            const auto element = [](u32 base, u32 offset) { return base == 255 ? 255U : base + offset; };
++            for (u32 i = 0; i < coordinates; ++i) {
++                const u32 source = i < in_a ? element(source_a, i) : element(source_b, i - in_a);
++                emit(0x5c98000000000000ULL | predicate | (250 + i) | (u64{15} << 39) | (u64{source} << 20));
++            }
++            for (u32 i = 0; i < meta; ++i) {
++                emit(0x5c98000000000000ULL | predicate | (246 + i) | (u64{15} << 39) |
++                     (u64{element(source_b, i)} << 20));
+             }
+             if (bindless) {
+                 emit(0x5c98000000000000ULL | predicate | 246 | (u64{15} << 39) | (u64{handle} << 20));
+@@ -2287,9 +2300,9 @@ inline LoweredProgram LowerToMaxwellWith(std::span<const Instruction> code, u32
+                      (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51));
+             } else {
+             emit(0xc800000000000000ULL | predicate | 250 | (u64{250} << 8) |
+-                 (u64{offsets ? 246U : 255U} << 20) | (u64{2} << 28) | (u64{mask} << 31) |
+-                 (u64{insn.Bits(40, 14)} << 36) | (u64{insn.Bits(90, 1)} << 49) | (u64{7} << 51) |
+-                 (u64{offsets ? 1U : 0U} << 54) | (u64{insn.Bits(87, 2)} << 56));
++                 (u64{meta ? 246U : 255U} << 20) | (u64{array ? 3U : 2U} << 28) | (u64{mask} << 31) |
++                 (u64{insn.Bits(40, 14)} << 36) | (u64{insn.Bits(90, 1)} << 49) | (u64{depth} << 50) |
++                 (u64{7} << 51) | (u64{offset_mode} << 54) | (u64{insn.Bits(87, 2)} << 56));
+             }
+             const u32 components = static_cast<u32>(std::popcount(mask));
+             const bool split = second_dest != 255;
+diff --git a/src/tests/video_core/ampere_lowering.cpp b/src/tests/video_core/ampere_lowering.cpp
+index 49fe914aea..26825b92f7 100644
+--- a/src/tests/video_core/ampere_lowering.cpp
++++ b/src/tests/video_core/ampere_lowering.cpp
+@@ -244,4 +244,50 @@ TEST_CASE("Ampere guarded uniform comparisons keep the output when the guard is
+     REQUIRE(static_cast<bool>(selected));
+     CHECK(selected.instructions.front() == 0x5ca000000df70403ULL);
+ }
++
++TEST_CASE("Ampere gathers take arrays, per-pixel offsets and depth references",
++          "[video_core][ampere]") {
++    const auto lower = [](const Instruction& instruction) {
++        const std::array<Instruction, 2> code{{instruction, EXIT}};
++        return LowerToMaxwell(code);
++    };
++    const auto field = [](u64 word, u32 offset, u32 count) {
++        return (word >> offset) & ((u64{1} << count) - 1);
++    };
++    // Ocarina: TLD4.R.2D.ARRAY R44, R42, R8, R4. Layer and x in R8, R9, y in R4.
++    const auto array = lower({{0x082c7b63, 0xb0801004, 0x001e0f2a, 0x00014200}});
++    INFO(array.error);
++    REQUIRE(static_cast<bool>(array));
++    REQUIRE(array.instructions.size() >= 4);
++    CHECK(array.instructions[0] == 0x5c980780008700faULL);
++    CHECK(array.instructions[1] == 0x5c980780009700fbULL);
++    CHECK(array.instructions[2] == 0x5c980780004700fcULL);
++    CHECK(field(array.instructions[3], 20, 8) == 255);
++    CHECK(field(array.instructions[3], 28, 3) == 3);
++    CHECK(field(array.instructions[3], 50, 1) == 0);
++    CHECK(field(array.instructions[3], 54, 2) == 0);
++
++    // Ocarina: @!P1 TLD4.R.PTP R24, R14, R6, R16: x, y in R6, R7, the offsets in R16, R17.
++    const auto per_pixel = lower({{0x06189b63, 0x30007c10, 0x001e2f0e, 0x000f4600}});
++    INFO(per_pixel.error);
++    REQUIRE(static_cast<bool>(per_pixel));
++    REQUIRE(per_pixel.instructions.size() >= 5);
++    CHECK(field(per_pixel.instructions[2], 20, 8) == 16);
++    CHECK(field(per_pixel.instructions[3], 20, 8) == 17);
++    CHECK(field(per_pixel.instructions[4], 20, 8) == 246);
++    CHECK(field(per_pixel.instructions[4], 28, 3) == 2);
++    CHECK(field(per_pixel.instructions[4], 54, 2) == 2);
++
++    // Ocarina: TLD4.R.DC R12, R14, R24, R28: x, y in R24, R25, the reference in R28.
++    const auto depth = lower({{0x180c7b63, 0x30800e1c, 0x001e4f0e, 0x000f4200}});
++    INFO(depth.error);
++    REQUIRE(static_cast<bool>(depth));
++    REQUIRE(depth.instructions.size() >= 4);
++    CHECK(field(depth.instructions[2], 20, 8) == 28);
++    CHECK(field(depth.instructions[3], 50, 1) == 1);
++    CHECK(field(depth.instructions[3], 54, 2) == 0);
++
++    // Offset mode 3 is not an offset form.
++    CHECK_FALSE(lower({{0x082c7b63, 0xb0801004, 0x001e3f2a, 0x00014200}}));
++}
+ } // namespace
