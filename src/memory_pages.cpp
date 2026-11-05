@@ -773,11 +773,7 @@ void* ReserveMemoryRange(std::size_t size) noexcept {
 
 // Address space alone, whatever the heap's development switches say (the heap's large blocks).
 void* ReserveAddressRange(std::size_t size) noexcept {
-#ifdef PS5_NATIVE
     return ReserveAddressRangeFrom(size, cpu_mapping_hint);
-#else
-    return ReserveAddressRangeFrom(size, 0);
-#endif
 }
 
 void* ReserveAddressRangeFrom(std::size_t size, [[maybe_unused]] std::uintptr_t hint) noexcept {
