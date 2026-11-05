@@ -103,6 +103,38 @@ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
         ('   if (!placed) {', '   if (!placed) {\n      fprintf(stderr, "radv/ps5: mapping rejected result=%d address=%p bytes=%llu window32=%d\\n", result, address, (unsigned long long)bytes, window32);'),
     ],
     # EglantinePS5: task/mesh draws hung the console's GPU (Mario Kart World, Zelda: Ocarina of Time).
+    'src/amd/vulkan/radv_shader.c': [
+        # EglantinePS5: spirv_to_nir returns NULL when its builder cannot be allocated or the module
+        # fails to parse, and radv_shader_spirv_to_nir then wrote nir->info.internal (offset 0x40):
+        # SIGSEGV at 0x40 on VkPipelineBuilder with the memory pool short (Zelda). A release build
+        # reports parse errors only to a debug-report callback: print them, retry a few times (the
+        # pool may have room again), and stop with a message instead of the fault.
+        ('static void\nradv_spirv_nir_debug(',
+         '#include "util/os_time.h"\n\nstatic void\nradv_spirv_nir_debug('),
+        ('   vk_debug_report(debug_data->debug_report, vk_flags[level], debug_data->object, 0, 0, "radv", buffer);\n}',
+         '   vk_debug_report(debug_data->debug_report, vk_flags[level], debug_data->object, 0, 0, "radv", buffer);\n'
+         '   if (level == NIR_SPIRV_DEBUG_LEVEL_ERROR)\n'
+         '      fprintf(stderr, "radv/ps5: %s\\n", buffer);\n}'),
+        ('      nir = spirv_to_nir(spirv, stage->spirv.size / 4, spec, stage->stage, stage->entrypoint, &spirv_options,\n'
+         '                         &compiler_info->nir_options[stage->stage]);\n'
+         '      nir->info.internal |= is_internal;',
+         '      nir = spirv_to_nir(spirv, stage->spirv.size / 4, spec, stage->stage, stage->entrypoint, &spirv_options,\n'
+         '                         &compiler_info->nir_options[stage->stage]);\n'
+         '      for (unsigned attempt = 1; !nir && attempt <= 8; attempt++) {\n'
+         '         fprintf(stderr, "radv/ps5: SPIR-V to NIR failed (%s, %u words, entry %s), attempt %u of 8\\n",\n'
+         '                 _mesa_shader_stage_to_string(stage->stage), (unsigned)(stage->spirv.size / 4),\n'
+         '                 stage->entrypoint ? stage->entrypoint : "?", attempt);\n'
+         '         os_time_sleep(50000);\n'
+         '         nir = spirv_to_nir(spirv, stage->spirv.size / 4, spec, stage->stage, stage->entrypoint, &spirv_options,\n'
+         '                            &compiler_info->nir_options[stage->stage]);\n'
+         '      }\n'
+         '      if (!nir) {\n'
+         '         fprintf(stderr, "radv/ps5: SPIR-V to NIR failed for good: out of memory, or a module the parser "\n'
+         '                         "refuses (a radv/ps5: SPIR-V offset line above says which)\\n");\n'
+         '         abort();\n'
+         '      }\n'
+         '      nir->info.internal |= is_internal;'),
+    ],
     'src/amd/vulkan/radv_shader_info.c': [
         # Parts of whole primitives that fit one NGG subgroup's 256 vertices: 256 triangles are
         # 4 parts of 64, not 3 of 86 (258 vertices). ac_nir_lower_ngg_mesh derives each part's
