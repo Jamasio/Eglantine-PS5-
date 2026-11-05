@@ -2123,9 +2123,13 @@ if(EDEN_PS5_OPENGL)
         list(APPEND video_sources "${MACRO_OUTPUT}")
     endif()
     file(READ "${PROJECT_SOURCE_DIR}/src/video_core/gpu_thread.h" gpu_thread_header)
-    string(REPLACE "using CommandQueue = Common::SPSCQueue<CommandDataContainer>;"
-        "using CommandQueue = Common::SPSCQueue<CommandDataContainer, 8>;"
-        gpu_thread_header "${gpu_thread_header}")
+    # The GPU command queue stays unbounded (core patch 0027): with 8 entries, nx2:gpu requests
+    # that queue GPU maps under the registry and region locks, and a GPU-thread write into a lazily
+    # backed region that takes those locks, waited on each other (a loading screen that stops).
+    string(FIND "${gpu_thread_header}" "Common::HostCommandQueue<CommandDataContainer>" unbounded_queue_at)
+    if(unbounded_queue_at LESS 0)
+        message(FATAL_ERROR "The GPU command queue is bounded again (tools/eglantine-patches/0027)")
+    endif()
     string(REPLACE "    ~ThreadManager();" "    ~ThreadManager();\n    void Stop() { thread.request_stop(); if (thread.joinable()) thread.join(); }" gpu_thread_header "${gpu_thread_header}")
     if(PS5_NATIVE)
         string(PREPEND gpu_thread_header "#include <pthread.h>\n#include <condition_variable>\n")
