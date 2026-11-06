@@ -138,6 +138,10 @@ bool ReserveBlock(std::int64_t* physical) noexcept {
     if (ok) counters.reserve_used.fetch_add(1, std::memory_order_relaxed);
     return ok;
 }
+// The same for a page table slot, which has no other way out.
+bool TableReserveBlock(std::int64_t* physical) noexcept {
+    return std::getenv("EDEN_TABLE_NO_RESERVE") == nullptr && ReserveBlock(physical);
+}
 // A zeroed block from the reserve first, while the pool is short.
 bool SparedBlock(std::int64_t* physical) noexcept {
     return pool_is_short.load(std::memory_order_relaxed) &&

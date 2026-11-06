@@ -356,11 +356,17 @@ void* ReserveSparse(std::size_t span, [[maybe_unused]] bool guest = false) {
 }
 
 // Gives the slot at `at` memory of its own, zeroed and writable. sparse_mutex is held.
+#ifdef PS5_NATIVE
+bool TableReserveBlock(std::int64_t* physical) noexcept; // guest_memory_service.inc
+#endif
 bool OwnSlot(std::uintptr_t at, std::int64_t* physical) {
 #ifdef PS5_NATIVE
     // The block is zeroed before it appears in the table: a JIT thread may read the slot at any
     // moment, and the mapping changes in one step.
-    if (!ZeroedBlock(physical)) return false;
+    // A table slot has nowhere to go if this fails (CommitSparsePage ends the app), so it may
+    // take a block of the guest reserve, as the guest writes do: run 62 ended here with 242 MiB
+    // of the reserve idle.
+    if (!ZeroedBlock(physical) && !TableReserveBlock(physical)) return false;
     if (MapSlot(at, PROT_READ | PROT_WRITE, *physical)) return true;
     (void)sceKernelReleaseDirectMemory(*physical, SparseSlot);
     return false;
