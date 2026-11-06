@@ -1,0 +1,63 @@
+gpu_dirty_memory: one gatherer at a time (off by default)
+
+Core patch. Paths are the submodule's. Applies on core16 alone.
+
+Source: Frizti/Lichii 7e1d645557 (Lichii #138, by Paulo Tumabing), the memory part only.
+
+EDEN_NX2_GATHER_LOCK=1. Gather swaps front_buffer under guard, then walks it with no lock. Two
+gatherers can swap or clear it while the other walks it, handing the buffer cache a garbage address.
+Lichii saw this crash in MemoryTracker::IteratePages on a movie in Final Fantasy Resonance. There the
+second gatherer was a video decode read; core16 lacks that call. Ours could only be a sync request
+and a fence running together on the split's two threads, which is not proven to happen. No console
+crash has been traced to this.
+
+Changed from the source: off by default, there always on.
+
+Runs on the PS5: same core path.
+Hang: the lock is held across the callback, which takes the texture and buffer cache mutexes. Read,
+not run: no InvalidateGPUCache caller in core16 holds either mutex (fence manager, gpu.cpp, puller,
+Maxwell3D, query cache's SignalFence), SignalFence drops its guard first, and the callback's texture,
+buffer and pipeline calls show no gather. Keep it that way: a new gather under a cache mutex would
+be a lock inversion, so a freeze.
+Pool memory: none.
+Checked: applies on core16. PS5-target syntax compile of a file that calls Gather, no errors; a planted
+error proved the patched header was the one compiled. Lock order read, not run. Not run on the console.
+
+Co-authored-by: Paulo Tumabing <85124994+Shrxmy@users.noreply.github.com>
+
+diff --git a/src/core/gpu_dirty_memory_manager.h b/src/core/gpu_dirty_memory_manager.h
+--- a/src/core/gpu_dirty_memory_manager.h
++++ b/src/core/gpu_dirty_memory_manager.h
+@@ -5,6 +5,7 @@
+ 
+ #include <atomic>
+ #include <bit>
++#include <cstdlib>
+ #include <functional>
+ #include <mutex>
+ #include <utility>
+@@ -48,6 +49,16 @@
+     }
+ 
+     void Gather(std::function<void(PAddr, size_t)>& callback) {
++        // EDEN_NX2_GATHER_LOCK=1: one gatherer at a time, so none can swap or clear front_buffer
++        // while another walks it. A function-local static: env.txt is read in main.
++        static const bool lock_gathers = [] {
++        const char* const value = std::getenv("EDEN_NX2_GATHER_LOCK");
++        return value != nullptr && value[0] == '1';
++    }();
++        std::unique_lock gather_lk(gather_guard, std::defer_lock);
++        if (lock_gathers) {
++            gather_lk.lock();
++        }
+         {
+             std::scoped_lock lk(guard);
+             TransformAddress t = current.exchange(default_transform, std::memory_order_relaxed);
+@@ -115,6 +126,7 @@
+ 
+     std::atomic<TransformAddress> current{};
+     std::mutex guard;
++    std::mutex gather_guard;
+     std::vector<TransformAddress> back_buffer;
+     std::vector<TransformAddress> front_buffer;
+ };

@@ -1,0 +1,125 @@
+usage_tracker: mark every 64-byte block a range touches (off by default)
+
+Core patch. Paths are the submodule's. Applies on core16 alone.
+
+Source: Frizti/Lichii 765659af4c (branch oot-gather-fix, v2), which carries zortos293's e8be5d3d59
+(masks) and b16ba4f0dc (reset guard, ported from sylvieistaken/selevet-eglantine d8c95fef47).
+
+EDEN_NX2_USAGE_EXACT=1. TrackPage and IsPageUsed count size >> 6 blocks from the first one. A range
+that is not 64-byte aligned covers one block more than that, and the last one was never marked. A
+range under 64 bytes gives 0 blocks and a shift by 64, undefined in C++. The answer decides
+CanReorderUpload: a region read as unused lets an upload move ahead of the frame's draws, so a draw
+could read the new data early. With the switch every touched block counts and empty ranges do
+nothing. Also skips the per-frame clear for buffers nothing tracked since the last one.
+
+Changed from the source: off by default, there always on. Reset stays as it was and the guard is a
+new ResetIfTracked, so lichii-cpu-0235 still applies.
+
+Runs on the PS5: same core path. Whether the console ever hits the bad order is unknown.
+Hang: none, no wait added. More regions read as used, so a few uploads stop being reordered.
+Pool memory: none. Two bools per buffer.
+Checked: applies on core16, and in both orders with lichii-cpu-0234 and 0235. PS5-target syntax compile of
+vk_buffer_cache.cpp, no errors. Real header against the old one and a byte model, 863,213 random
+queries: switch off, 0 differences from the old header; switch on, 0 differences from the model. The
+old code said unused where used 856 times of 271,310. IsUsed also checks from the page start when
+the range ends on the same page, in core16 and in Lichii: harmless, says used more often, left alone.
+Not run on the console.
+
+Co-authored-by: zortos293 <65777760+zortos293@users.noreply.github.com>
+
+diff --git a/src/video_core/buffer_cache/usage_tracker.h b/src/video_core/buffer_cache/usage_tracker.h
+--- a/src/video_core/buffer_cache/usage_tracker.h
++++ b/src/video_core/buffer_cache/usage_tracker.h
+@@ -9,6 +9,7 @@
+ #include <array>
+ #include <utility>
+ #include <vector>
++#include <cstdlib>
+ 
+ #include "common/alignment.h"
+ #include "common/common_types.h"
+@@ -24,8 +25,23 @@
+     explicit UsageTracker(size_t size) {
+         const size_t num_pages = (size >> BUFFER_PAGE_SHIFT) + 1;
+         pages.resize(num_pages, 0ULL);
++        // EDEN_NX2_USAGE_EXACT=1: a function-local static, env.txt is read in main.
++        static const bool exact_blocks = [] {
++        const char* const value = std::getenv("EDEN_NX2_USAGE_EXACT");
++        return value != nullptr && value[0] == '1';
++    }();
++        exact = exact_blocks;
+     }
+ 
++    /// Reset, skipped with EDEN_NX2_USAGE_EXACT=1 for a tracker untouched since the last one.
++    void ResetIfTracked() noexcept {
++        if (exact && !tracked) {
++            return;
++        }
++        tracked = false;
++        Reset();
++    }
++
+     void Reset() noexcept {
+         std::ranges::fill(pages, 0ULL);
+         recent.fill({~u64{0}, 0});
+@@ -40,6 +56,7 @@
+                 return;
+             }
+         }
++        tracked = true;
+         recent[recent_cursor++ % recent.size()] = {offset, size};
+         const size_t page = offset >> BUFFER_PAGE_SHIFT;
+         const size_t page_end = (offset + size) >> BUFFER_PAGE_SHIFT;
+@@ -81,7 +98,11 @@
+     void TrackPage(u64 page, u64 offset, u64 size) noexcept {
+         const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
+         const size_t first_bit = offset_in_page >> BUFFER_BYTES_PER_BITSHIFT;
+-        const size_t num_bits = std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
++        if (exact && size == 0) {
++            return;
++        }
++        const size_t num_bits = exact ? ExactBits(offset_in_page, size)
++                                      : std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
+         const size_t mask = ~u64{0} >> (64 - num_bits);
+         pages[page] |= (~u64{0} & mask) << first_bit;
+     }
+@@ -89,13 +110,26 @@
+     bool IsPageUsed(u64 page, u64 offset, u64 size) const noexcept {
+         const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
+         const size_t first_bit = offset_in_page >> BUFFER_BYTES_PER_BITSHIFT;
+-        const size_t num_bits = std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
++        if (exact && size == 0) {
++            return false;
++        }
++        const size_t num_bits = exact ? ExactBits(offset_in_page, size)
++                                      : std::min<size_t>(size, BUFFER_PAGE_BYTES) >> BUFFER_BYTES_PER_BITSHIFT;
+         const size_t mask = ~u64{0} >> (64 - num_bits);
+         const size_t mask2 = (~u64{0} & mask) << first_bit;
+         return (pages[page] & mask2) != 0;
+     }
+ 
++    /// Blocks from the first one that a range of size bytes at offset_in_page touches.
++    size_t ExactBits(size_t offset_in_page, u64 size) const noexcept {
++        const size_t bytes = std::min<size_t>(size, BUFFER_PAGE_BYTES - offset_in_page);
++        const size_t last_bit = (offset_in_page + bytes - 1) >> BUFFER_BYTES_PER_BITSHIFT;
++        return last_bit - (offset_in_page >> BUFFER_BYTES_PER_BITSHIFT) + 1;
++    }
++
+ private:
++    bool exact{};
++    bool tracked{};
+     std::vector<u64> pages;
+     /// Ranges tracked last, (offset, size).
+     std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
+diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.h b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+--- a/src/video_core/renderer_vulkan/vk_buffer_cache.h
++++ b/src/video_core/renderer_vulkan/vk_buffer_cache.h
+@@ -65,7 +65,7 @@
+     void MarkUsage(u64 offset, u64 size) noexcept;
+ 
+     void ResetUsageTracking() noexcept {
+-        tracker.Reset();
++        tracker.ResetIfTracked();
+     }
+ 
+     [[nodiscard]] u64 LastUsageTick() const noexcept {

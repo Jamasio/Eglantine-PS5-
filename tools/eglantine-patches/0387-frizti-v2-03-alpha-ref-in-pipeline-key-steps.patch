@@ -1,0 +1,55 @@
+vulkan: round the alpha test reference to 1/255 in the pipeline key (off by default)
+
+Core patch. Paths are the submodule's. Applies on core16 alone.
+
+Source: Frizti/Lichii ec3a455c6f by zortos293, a port of Djihads80/Eglantine#544 (9b603f53a7).
+
+EDEN_NX2_ALPHA_REF_ROUND=1. Titles that fade with the alpha test on move the reference by less than
+one 8-bit step a frame, and each value is a new pipeline. The PR measured 925 to 101 pipelines built
+in a Fire Emblem scene on PC. Rounding keeps one pipeline per step textures can tell apart. The
+threshold moves by at most half a step.
+
+Why here: a pipeline costs pool memory and a stall on the console. Ocarina's own count is unknown.
+
+Changed from the source: off by default, there always on.
+
+Runs on the PS5: same core path.
+Hang: none. Keys change while it is on, so pipelines stored with unrounded values build once more.
+Pool memory: none added; fewer pipelines if the game fades this way.
+Checked: applies on core16. PS5-target syntax compile, no errors. 2 million reference values: 256 keys,
+rounding twice changes nothing, largest shift exactly half a step. Not run on the console.
+
+Co-authored-by: zortos293 <65777760+zortos293@users.noreply.github.com>
+
+diff --git a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+--- a/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
++++ b/src/video_core/renderer_vulkan/fixed_pipeline_state.cpp
+@@ -5,6 +5,8 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
+ #include <algorithm>
++#include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <bit>
+ #include <numeric>
+@@ -184,10 +186,18 @@
+     // The reference is part of the pipeline only while the test compares with it: title 1
+     // animates the register with the test off (text fading in and out), which made a new
+     // pipeline, translated on the GPU thread, for every value (~84% of its runtime pipelines).
++    // EDEN_NX2_ALPHA_REF_ROUND=1: titles that fade with the test on move the reference by less
++    // than one step of 8-bit alpha a frame: one pipeline per step the textures can tell apart.
++    static const bool round_alpha_ref = [] {
++        const char* const value = std::getenv("EDEN_NX2_ALPHA_REF_ROUND");
++        return value != nullptr && value[0] == '1';
++    }();
++    const float alpha_ref = round_alpha_ref ? std::round(regs.alpha_test_ref * 255.0f) / 255.0f
++                                            : regs.alpha_test_ref;
+     const u32 packed_alpha_test = alpha_test_func.Value();
+     alpha_test_ref = packed_alpha_test != PackComparisonOp(Maxwell::ComparisonOp::Never_GL) &&
+                              packed_alpha_test != PackComparisonOp(Maxwell::ComparisonOp::Always_GL)
+-                         ? std::bit_cast<u32>(regs.alpha_test_ref)
++                         ? std::bit_cast<u32>(alpha_ref)
+                          : 0;
+     point_size = std::bit_cast<u32>(regs.point_size);
+ 
