@@ -2,6 +2,7 @@
 // The crash report (crash_report.h). What the handler runs is in this file and uses only system
 // calls, atomics and the buffers below.
 #include "crash_report.h"
+#include "../src/fastmem.h"
 
 #include <signal.h>
 #include <algorithm>
@@ -12,6 +13,7 @@
 #include <ctime>
 #include <fcntl.h>
 #include <fstream>
+#include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -79,6 +81,24 @@ char sessions[2][400];
 std::atomic<unsigned> session_now{0};
 std::atomic<bool> reported{false};  // the report is written: the helper threads act
 int probe_pipe[2] = {-1, -1};       // memory is read through it (Copy)
+
+// Signal stacks (EDEN_SIGNAL_STACK): one mapping a thread, made when a thread first needs one and
+// kept for the next thread. Not touched by a handler except to read where they lie. Without one the
+// frame of a signal goes on the interrupted stack, and a thread at its guard page has no room for
+// it: FreeBSD ends such a process with no handler run, and the same goes for a fault in a handler
+// while its signal is masked. The signal is delivered on this thread's stack whatever fiber runs.
+constexpr std::size_t kSignalStackBytes = 32 * 1024, kSignalGuardBytes = 16384;
+struct SignalStack {
+    unsigned char* stack;  // the usable part; null: not made yet
+    bool taken;
+};
+SignalStack signal_stacks[kNamedThreads];
+std::atomic_flag signal_stacks_lock = ATOMIC_FLAG_INIT;
+std::atomic<bool> signal_stacks_on{false};
+std::atomic<unsigned> signal_stacks_made{0}, signal_stacks_refused{0};
+pthread_key_t signal_stack_key{};
+bool signal_stack_key_made = false;
+std::atomic<bool> crash_test_nested{false};
 
 std::uintptr_t CodeStart() noexcept { return reinterpret_cast<std::uintptr_t>(__eden_text_start); }
 std::uintptr_t CodeEnd() noexcept { return reinterpret_cast<std::uintptr_t>(__eden_text_end); }
@@ -235,6 +255,9 @@ void PutCalls(std::uint64_t stack) noexcept {
     unsigned found = 0;
     static std::uint64_t words[512];
     std::uint64_t at = stack & ~std::uint64_t{7};
+    // A stack overflow leaves the stack pointer in the guard page: the calls lie just above it.
+    for (unsigned page = 0; page < 8 && !Copy(reinterpret_cast<const void*>(at), words, 8); ++page)
+        at = (at | 4095) + 1;
     for (std::size_t seen = 0; seen < kWords && found < kMost;) {
         // Up to the end of the page: a read is whole or not at all.
         const std::size_t bytes = std::min<std::size_t>(4096 - (at & 4095), sizeof(words));
@@ -273,6 +296,14 @@ Registers FromContext(void* context) noexcept {
          m[10], m[11], m[12], m[13], m[14], m[15], m[22], m[16] & 0xffffffffu, m[19], true};
 #endif
     return r;
+}
+
+bool OnSignalStack(std::uint64_t address) noexcept {
+    for (const SignalStack& entry : signal_stacks) {
+        const auto stack = reinterpret_cast<std::uintptr_t>(entry.stack);
+        if (stack != 0 && address + kSignalGuardBytes >= stack && address < stack + kSignalStackBytes) return true;
+    }
+    return false;
 }
 
 const char* ThreadName(std::uintptr_t thread) noexcept {
@@ -363,6 +394,20 @@ void Compose(const Kind* kind, int code, std::uint64_t address, const Registers&
         t.Put(" large blocks\n");
     }
 #endif
+    if (signal_stacks_on.load(std::memory_order_acquire)) {
+        t.Put("signal stacks: ");
+        t.Dec(signal_stacks_made.load(std::memory_order_relaxed));
+        t.Put(" made, ");
+        t.Dec(signal_stacks_refused.load(std::memory_order_relaxed));
+        t.Put(" refused\n");
+    }
+    if (signal_stacks_on.load(std::memory_order_acquire) && OnSignalStack(r.rsp)) {
+        t.Put("stack: a signal stack, so this fault came inside a fault handler\n");
+    } else if (kind && kind->fault && probe_pipe[1] >= 0) {
+        std::uint64_t word = 0;
+        if (!Copy(reinterpret_cast<const void*>(r.rsp), &word, sizeof(word)))
+            t.Put("stack: the stack pointer is in memory that cannot be read: a stack overflow\n");
+    }
     t.Put("registers:");
     PutRegister("\n  ", "rip", r.rip);
     PutRegister("  ", "rsp", r.rsp);
@@ -491,7 +536,13 @@ void WriteReport(const Kind* kind, int code, std::uint64_t address, const Regist
     Note("EDEN_CRASH the app did not start again; the system handles the crash\n");
 }
 
+[[gnu::noinline]] void BadWrite() noexcept {
+    static volatile std::uintptr_t address = 16;
+    *reinterpret_cast<volatile int*>(address) = 1;
+}
+
 void Handle(int signal, siginfo_t* info, void* context) {
+    if (crash_test_nested.exchange(false, std::memory_order_relaxed)) BadWrite();
     if (!Enter()) return;
     const Kind* kind = &kKinds[0];
     for (const Kind& candidate : kKinds)
@@ -524,6 +575,68 @@ void Flusher() {
     WaitForReport();
     std::fflush(stderr);
     std::fflush(stdout);
+}
+
+// A stack from the table, made if need be. Never in a handler.
+SignalStack* TakeSignalStack() noexcept {
+    while (signal_stacks_lock.test_and_set(std::memory_order_acquire)) sched_yield();
+    SignalStack* found = nullptr;
+    for (SignalStack& entry : signal_stacks) {
+        if (entry.stack != nullptr && entry.taken) continue;
+        if (entry.stack == nullptr) {
+#ifdef PS5_NATIVE
+            // As a fiber's stack (fiber_stack.h): an address that names none goes to RADV's window.
+            void* const hint = reinterpret_cast<void*>(0x1000000000ull);
+#else
+            void* const hint = nullptr;
+#endif
+            constexpr std::size_t span = kSignalStackBytes + kSignalGuardBytes;
+            void* const mapped = mmap(hint, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (mapped == MAP_FAILED) break;
+            auto* const first = static_cast<unsigned char*>(mapped);
+            if (mprotect(first, kSignalGuardBytes, PROT_NONE) != 0) {
+                (void)munmap(mapped, span);
+                break;
+            }
+            // Its pages exist before a fault needs them: a signal's frame must not wait for memory.
+            std::memset(first + kSignalGuardBytes, 0, kSignalStackBytes);
+            entry.stack = first + kSignalGuardBytes;
+            signal_stacks_made.fetch_add(1, std::memory_order_relaxed);
+        }
+        entry.taken = true;
+        found = &entry;
+        break;
+    }
+    signal_stacks_lock.clear(std::memory_order_release);
+    return found;
+}
+
+void GiveSignalStack(SignalStack* entry) noexcept {
+    while (signal_stacks_lock.test_and_set(std::memory_order_acquire)) sched_yield();
+    entry->taken = false;
+    signal_stacks_lock.clear(std::memory_order_release);
+}
+
+// A thread ends (the key's destructor, on that thread): its stack goes to the next one. A stack the
+// system does not let go of stays taken.
+void LeaveSignalStack(void* opaque) {
+    auto* const entry = static_cast<SignalStack*>(opaque);
+    stack_t off{};
+    off.ss_sp = entry->stack;
+    off.ss_size = kSignalStackBytes;  // FreeBSD ignores it here; macOS refuses a size of 0
+    off.ss_flags = SS_DISABLE;
+    if (sigaltstack(&off, nullptr) == 0) GiveSignalStack(entry);
+}
+
+// Every signal of the report, with the flags the switch asks for.
+unsigned SetHandlers(int flags) noexcept {
+    struct sigaction action {};
+    action.sa_sigaction = Handle;
+    action.sa_flags = SA_SIGINFO | flags;
+    sigemptyset(&action.sa_mask);
+    unsigned handled = 0;
+    for (const Kind& kind : kKinds) handled += sigaction(kind.signal, &action, nullptr) == 0;
+    return handled;
 }
 
 void CopyText(char* target, std::size_t size, const char* text) noexcept {
@@ -564,15 +677,79 @@ void Install(const std::string& logs_folder, const char* app_version, bool resta
     if (!probe) probe_pipe[0] = probe_pipe[1] = -1;
     std::thread(Restarter).detach();
     std::thread(Flusher).detach();
-    struct sigaction action {};
-    action.sa_sigaction = Handle;
-    action.sa_flags = SA_SIGINFO;
-    sigemptyset(&action.sa_mask);
-    unsigned handled = 0;
-    for (const Kind& kind : kKinds) handled += sigaction(kind.signal, &action, nullptr) == 0;
+    const unsigned handled = SetHandlers(0);
     installed = true;
     std::fprintf(stderr, "EDEN_CRASH_REPORT installed=1 signals=%u stack_reads=%d folder=%s after_crash=%d\n", handled,
                  probe ? 1 : 0, logs, restarted ? 1 : 0);
+}
+
+bool ThreadSignalStack() noexcept {
+    if (!signal_stacks_on.load(std::memory_order_acquire)) return false;
+    stack_t now{};
+    if (sigaltstack(nullptr, &now) != 0) return false;
+    if (!(now.ss_flags & SS_DISABLE)) return true;  // a thread that names itself again
+    SignalStack* const entry = TakeSignalStack();
+    if (entry != nullptr) {
+        stack_t stack{};
+        stack.ss_sp = entry->stack;
+        stack.ss_size = kSignalStackBytes;
+        if (sigaltstack(&stack, nullptr) == 0) {
+            if (signal_stack_key_made) (void)pthread_setspecific(signal_stack_key, entry);
+            return true;
+        }
+        GiveSignalStack(entry);
+    }
+    const unsigned refused = signal_stacks_refused.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((refused & (refused - 1)) == 0)
+        std::fprintf(stderr, "EDEN_SIGNAL_STACK refused=%u made=%u\n", refused, signal_stacks_made.load());
+    return false;
+}
+
+void UseSignalStacks() noexcept {
+    const char* const asked = std::getenv("EDEN_SIGNAL_STACK");
+    if (!installed || !asked || asked[0] != '1') return;
+    signal_stack_key_made = pthread_key_create(&signal_stack_key, LeaveSignalStack) == 0;
+    signal_stacks_on.store(true, std::memory_order_release);
+    if (!ThreadSignalStack()) {
+        signal_stacks_on.store(false, std::memory_order_release);
+        std::fprintf(stderr, "EDEN_SIGNAL_STACK off: the system refused one (errno %d)\n", errno);
+        return;
+    }
+    const int flags = SA_ONSTACK | SA_NODEFER;
+    Fastmem::signal_flags.store(flags, std::memory_order_release);
+    Fastmem::thread_signal_stack.store(&ThreadSignalStack, std::memory_order_release);
+    const unsigned handled = SetHandlers(flags);
+    std::fprintf(stderr, "EDEN_SIGNAL_STACK on: %zu KiB a thread, signals=%u thread_end=%d\n", kSignalStackBytes >> 10,
+                 handled, signal_stack_key_made ? 1 : 0);
+}
+
+void RunCrashTest() noexcept {
+    const char* const how = std::getenv("EDEN_CRASH_TEST");
+    if (!how) return;
+    std::fprintf(stderr, "EDEN_CRASH_TEST how=%s signal_stack=%d\n", how, signal_stacks_on.load() ? 1 : 0);
+    std::fflush(stderr);
+    if (std::strcmp(how, "nested") == 0) {
+        crash_test_nested.store(true, std::memory_order_relaxed);
+        BadWrite();
+    } else if (std::strcmp(how, "stack") == 0) {
+        std::thread([] {
+            NameThread("CrashTest");
+            (void)ThreadSignalStack();
+            // Pages that cannot be touched, and the stack pointer in their middle: where a thread stands
+            // once it has run into its guard. Not at their end: what lies after them may be readable.
+            // A real overflow needs a stack with a known end.
+            constexpr std::size_t bytes = 65536;
+            void* const page = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (page == MAP_FAILED || mprotect(page, bytes, PROT_NONE) != 0) std::abort();
+            auto* const inside = static_cast<unsigned char*>(page) + bytes / 2;
+#if defined(__x86_64__)
+            asm volatile("movq %0, %%rsp\n\tpushq %%rax" : : "r"(inside) : "memory");
+#else
+            (void)inside;
+            std::abort();
+#endif
+        }).join();
+    }
 }
 
 void SetSession(const std::string& text, bool game) noexcept {

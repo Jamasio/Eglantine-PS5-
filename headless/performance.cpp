@@ -448,6 +448,7 @@ extern "C" void eden_heap_growth_report(void) __attribute__((weak));
 extern "C" void eden_heap_arena_report(void) __attribute__((weak));
 extern "C" void eden_heap_name_thread(const char* name) __attribute__((weak));
 extern "C" unsigned eden_guest_memory_wanted(void) __attribute__((weak));
+extern "C" void eden_guest_fault_thread_ready(void) __attribute__((weak));
 extern "C" void eden_guest_memory_reserve(std::size_t* held, std::size_t* target) __attribute__((weak));
 extern "C" void eden_guest_memory_report(void) __attribute__((weak));
 extern "C" void eden_guest_memory_pool_short(int is_short) __attribute__((weak));
@@ -969,6 +970,12 @@ void RegisterWorker(const char* name) {
     MkwNativeSample::Register(name);
 #endif
     Eden::Crash::NameThread(name);  // a crash report names the thread
+    // With signal stacks on (crash_report.h): this thread's, and the fault handler's thread-locals
+    // made here, not in a handler (emulated TLS allocates at the first use). Through the pointer:
+    // tools/check-startup-performance.py links this file without crash_report.cpp.
+    if (const auto give = Eden::Fastmem::thread_signal_stack.load(std::memory_order_acquire);
+        give != nullptr && give() && eden_guest_fault_thread_ready)
+        eden_guest_fault_thread_ready();
     if (eden_heap_name_thread) eden_heap_name_thread(name);  // and the heap's reports
 #if defined(EDEN_DEV_PROFILE) && defined(PS5_NATIVE)
     Eden::Stall::NoteThread(name);

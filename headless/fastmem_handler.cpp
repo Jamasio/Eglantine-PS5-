@@ -2,8 +2,9 @@
 // Dynarmic x64 fastmem fault handler for the PS5 port and its Linux host checks, after
 // dynarmic's exception_handler_posix.cpp (0BSD). A fault at a fastmem access in JIT code
 // becomes a call to that access's fallback, which returns after the faulting instruction;
-// dynarmic then recompiles the access onto the page-table path. Guest code runs on
-// fiber stacks with ample room, so no alternate signal stack is used.
+// dynarmic then recompiles the access onto the page-table path. The fallback's return address
+// goes on the interrupted stack (the context's rsp), which is the fiber's whichever stack this
+// handler itself runs on (EDEN_SIGNAL_STACK, crash_report.h).
 #include <signal.h>
 #include <array>
 #include <atomic>
@@ -70,7 +71,7 @@ bool Install() {
     std::call_once(install_once, [] {
         struct sigaction action{};
         action.sa_sigaction = Handle;
-        action.sa_flags = SA_SIGINFO | SA_RESTART;
+        action.sa_flags = SA_SIGINFO | SA_RESTART | Eden::Fastmem::signal_flags.load(std::memory_order_acquire);
         sigemptyset(&action.sa_mask);
         installed = sigaction(SIGSEGV, &action, &previous_segv) == 0 &&
                     sigaction(SIGBUS, &action, &previous_bus) == 0;
