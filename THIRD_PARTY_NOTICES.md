@@ -17,7 +17,10 @@ builds on the following projects, each under its own license.
   b94216347b9a), by way of heydemoura/EglantinePS5 033e453471 (Heyde Moura);
   page reuse (`headless/dynarmic/page-reuse.cmake`, `page_reuse_pass.inc`, the same PR);
   free-register moves, R13, plain ordered reads and `headless/dynarmic/fast_paths.cmake` (PR 189,
-  commit 64a1ee754a3b).
+  commit 64a1ee754a3b);
+  and from heydemoura/EglantinePS5, native MME dispatch (`headless/macro_native*`,
+  `tools/check-macro-native*`, 9206f0adf9, adapted from ProsperoEden; instruction streams appear
+  only as SHA-256 signatures).
 - **[Zortos Eglantine fork](https://github.com/zortos293/Eglantine)**,
   GPL-3.0-or-later. Referenced directly by the `Eglantine` submodule, including its
   core, native shader, readback, service, runtime and test changes. The maintained

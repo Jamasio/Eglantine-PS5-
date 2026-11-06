@@ -2486,6 +2486,7 @@ set_property(SOURCE "${PORT_BUILD_DIR}/shader_environment.cpp" APPEND PROPERTY O
     "${EDEN_PORT_DIR}/shader_cache_reader.inc")
 list(REMOVE_ITEM video_sources shader_environment.cpp)
 list(APPEND video_sources "${PORT_BUILD_DIR}/shader_environment.cpp")
+include("${EDEN_PORT_DIR}/macro_native.cmake")
 set_property(TARGET video_core PROPERTY SOURCES "${video_sources}")
 # AV1 for Switch 2 movies: the static libavcodec's libdav1d decoder needs dav1d itself, which
 # tools/build-headless-dav1d.sh installs beside it (FindFFmpeg only lists FFmpeg's own archives).
