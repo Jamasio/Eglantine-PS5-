@@ -1,0 +1,154 @@
+dma_pusher: only methods that can write memory move the split's writer mark (off by default)
+
+Core patch. Paths are the submodule's. Applies on core16 alone, and before or after lichii-gpu 0210-0216.
+
+Source: Frizti/Lichii 99b3b49595 (Frizti, branch oot-gather-fix), as narrowed in zortos293/Lichii
+cbf7bf99ce (Zortos, perf/frizti-wait-ports; open PR 194 has the same diff as 8f33a1bf4a),
+GPL-3.0-or-later.
+
+EDEN_NX2_WRITER_CLASS=1. Before each GP entry the front waits for the last "writer" sent. Today every
+compute and copy method the list sends is a writer, so the wait covers all queued work, draws
+included. Frizti measured that at about 17% of the front thread in Ocarina on an RTX 4080 PC. That
+number does not carry over. Run 61 and 62 cannot say what it is here; lichii-gpu-0210 reports it as
+"list writers".
+
+With the switch a native compute method that only stores its value, and a copy register outside the
+execution mask, leave the mark. Dispatches, uploads, reports, macros and launches still move it. The
+same mark feeds EDEN_NX2_SEM_FAST, EDEN_NX2_DMA_WAIT_WRITERS and EDEN_NX2_LIST_FAST (0215, 0216), so
+their waits get shorter too. Frizti notes that with compute always queued such checks almost never
+passed before.
+
+Limit: only what the command list sends itself leaves the mark. Frizti's commit blames the QMD fields
+macros replay, but with macros on the front those writes never reach the mark, and every macro call
+moves it whatever the macro wrote. So a macro that only replays QMD fields moves the mark as before.
+The gain is the plain writes a list sends after its last dispatch or macro. Nothing counts those yet,
+so the gain here is unknown.
+
+Changed from the source: the call sites stay as they are and a flag tells NoteWriter to leave the
+mark, so this applies around 0215's lines; off by default.
+
+Runs on the PS5: yes. Run 61 logs the split with macros on the first thread.
+Hang: adds no wait, it only ends one sooner. A plain method cannot write memory by the code:
+KeplerCompute::CallMethod stores the value and returns, and those copy registers only reach the method
+sink. Lichii's command_writer test checks the same table. One gap: the old mark also covered draws
+queued before a plain write, by accident. A list on a page such a draw writes for the first time can
+now run stale. The same gap exists today when no compute method follows the draw (0215: "a draw's
+first shader store"), and run 62 logged no "written by draws too" line.
+Pool memory: none.
+Checked: PS5-target syntax compile, alone and on a stack of 42 other patches; anchors unchanged. Not
+run.
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index 476077d869..35f3e2a812 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -455,6 +455,33 @@ bool DmaPusher::WantsSegment() const {
+            (engine == Engines::EngineTypes::Maxwell3D && dma_state.method >= MacroRegistersStart);
+ }
+ 
++// EDEN_NX2_WRITER_CLASS=1: a compute or copy method the command list sends moves the split's writer
++// mark only if it can write memory. Without it every one does, so a list fetched after one waits
++// for all work queued before it, draws included. A native plain method only stores its value
++// (KeplerCompute::CallMethod returns right after), and a copy register outside the execution mask
++// only reaches the method sink. Dispatches, uploads, reports and launches still count, and so does
++// every macro call: what a macro writes does not come through here, so one that only replays QMD
++// fields moves the mark as before.
++// From Frizti/Lichii 99b3b49595 (Frizti), as ported in zortos293/Lichii cbf7bf99ce.
++bool DmaPusher::PlainStateMethod() const {
++    static const bool classify = [] {
++        const char* value = std::getenv("EDEN_NX2_WRITER_CLASS");
++        return value != nullptr && value[0] == '1';
++    }();
++    if (!classify) {
++        return false;
++    }
++    auto* const engine = subchannels[dma_state.subchannel];
++    switch (subchannel_type[dma_state.subchannel]) {
++    case Engines::EngineTypes::KeplerCompute:
++        return !static_cast<const Engines::KeplerCompute*>(engine)->MayWriteMemory(dma_state.method);
++    case Engines::EngineTypes::MaxwellDMA:
++        return dma_state.method < MacroRegistersStart && !engine->execution_mask[dma_state.method];
++    default:
++        return false;
++    }
++}
++
+ void DmaPusher::CallMethod(u32 argument) {
+     if (g_semaphore_watch != 0) [[unlikely]] {
+         WatchArgument(dma_state.method, argument);
+@@ -473,6 +500,7 @@ void DmaPusher::CallMethod(u32 argument) {
+             ReportUnboundSubchannel();
+             return;
+         }
++        split.SetPlainMethod(PlainStateMethod());
+         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
+         const auto engine_type = subchannel_type[dma_state.subchannel];
+         const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
+@@ -532,6 +560,7 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+             ReportUnboundSubchannel();
+             return;
+         }
++        split.SetPlainMethod(PlainStateMethod());
+         // Compute dispatches and DMA copies write the command lists ReadGpuWrittenCommands reads.
+         const auto engine_type = subchannel_type[dma_state.subchannel];
+         const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
+diff --git a/src/video_core/dma_pusher.h b/src/video_core/dma_pusher.h
+index c7ce172b76..c65b732f63 100644
+--- a/src/video_core/dma_pusher.h
++++ b/src/video_core/dma_pusher.h
+@@ -202,6 +202,8 @@ private:
+     void CallMethod(u32 argument);
+     void CallMultiMethod(const u32* base_start, u32 num_methods);
+     [[nodiscard]] bool WantsSegment() const;
++    /// A compute or copy method that only stores state (EDEN_NX2_WRITER_CLASS).
++    [[nodiscard]] bool PlainStateMethod() const;
+     void ReportUnboundSubchannel();
+     void WatchArgument(u32 method, u32 argument) const;
+ 
+diff --git a/src/video_core/engines/kepler_compute.h b/src/video_core/engines/kepler_compute.h
+index 6cafb47887..760bdfa116 100644
+--- a/src/video_core/engines/kepler_compute.h
++++ b/src/video_core/engines/kepler_compute.h
+@@ -65,6 +65,14 @@ public:
+     /// Binds a rasterizer to this engine.
+     void BindRasterizer(VideoCore::RasterizerInterface* rasterizer);
+ 
++    /// Whether the method can write memory, not only store its value (EDEN_NX2_WRITER_CLASS).
++    [[nodiscard]] bool MayWriteMemory(u32 method) const {
++        if (method >= native_plain_methods.size()) {
++            return true;
++        }
++        return native_mode ? !native_plain_methods[method] : execution_mask[method];
++    }
++
+     /// The channel's MME data RAM, shared with its 3D engine.
+     void SetNativeDataRam(std::array<u32, 0xc00>* data_ram) { native_data_ram = data_ram; }
+     void SetNativeMacroMode(MacroEngine* shared_macro, std::span<u32> positions, NativeMacroContext* context = nullptr) {
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index 11eeb7f398..27bcccd68f 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -159,8 +159,15 @@ public:
+ 
+     /// Compute or copy work was just sent: what can write GPU-written command lists.
+     void NoteWriter() {
++        if (plain_method) {
++            return;
++        }
+         last_writer_position = write_position;
+     }
++    /// The method being sent only stores state: NoteWriter leaves the mark (EDEN_NX2_WRITER_CLASS).
++    void SetPlainMethod(bool plain) {
++        plain_method = plain;
++    }
+     /// Waits until the back executed the compute and copy work sent so far (not what came after).
+     /// Returns whether any of it was still queued.
+     bool WaitForWriters();
+@@ -223,6 +230,7 @@ private:
+     Core::System* system{};
+     bool active{};
+     bool front_macros{};
++    bool plain_method{}; ///< Front side: see SetPlainMethod
+     std::unique_ptr<u64[]> ring;
+ 
+     // Front side.
