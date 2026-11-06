@@ -1,0 +1,154 @@
+From: Felipe Lima <felipe.lima@gmail.com>
+Subject: [PATCH] vulkan: drop draws recorded after a graphics pipeline that failed to build
+
+Core patch, for tools/eglantine-patches as 0200, after 0181.
+
+Port of zortos293/Lichii PR 142 (fe6a388a4b, Felipe Lima). There ConfigureDraw returned early on a
+failed pipeline, but the draws recorded after it still reached the driver with no pipeline, or
+with the one bound before (Mesa ANV crashed in vkCmdDraw).
+
+Here it is the same hole. ConfigureImpl only skips a draw once the pipeline is known to have
+failed (IsBuilt() && !pipeline). Pipelines build on a worker thread, so a first draw goes through
+while the build runs, and the GPU thread's bind finds nothing. The 0181 nullptr path is not this
+one: there PrepareDraw sees no pipeline and records nothing.
+
+Changed from the source: a switch of ours, and no TraceGpuWork (this tree does not have it).
+
+Switch: EDEN_NX2_PIPELINE_FAIL_SOFT=1. Default off, the old behaviour. Set it together with 0201,
+which uses the same switch.
+
+Memory: none. Not run on a console. Syntax checked with clang (stubs for the SDK); not compiled
+for the console.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index a2a84b42c1..df6a78d020 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -733,6 +733,7 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+             cmdbuf.BindDescriptorBuffersEXT(binding_info);
+         }
+         if (bind_pipeline) {
++            scheduler.SetGraphicsPipelineMissing(!pipeline && PipelineFailSoft());
+             if (!pipeline) {
+                 return;
+             }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 58cd149b26..a4f44623b4 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -773,12 +773,18 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+                 }
+                 return;
+             }
+-            scheduler.Record([groups](vk::CommandBuffer cmdbuf) {
++            scheduler.Record([this, groups](vk::CommandBuffer cmdbuf) {
++                if (scheduler.GraphicsPipelineMissing()) {
++                    return;
++                }
+                 cmdbuf.DrawMeshTasksEXT(groups, 1, 1);
+             });
+             return;
+         }
+-        scheduler.Record([draw_params](vk::CommandBuffer cmdbuf) {
++        scheduler.Record([this, draw_params](vk::CommandBuffer cmdbuf) {
++            if (scheduler.GraphicsPipelineMissing()) {
++                return;
++            }
+             if (draw_params.is_indexed) {
+                 cmdbuf.DrawIndexed(draw_params.num_vertices, draw_params.num_instances,
+                                    draw_params.first_index, draw_params.base_vertex,
+@@ -826,8 +832,11 @@ void RasterizerVulkan::DrawIndirect() {
+             return;
+         }
+         if (params.is_byte_count) {
+-            scheduler.Record([buffer_obj = buffer->Handle(), offset,
++            scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
+                               stride = params.stride](vk::CommandBuffer cmdbuf) {
++                if (scheduler.GraphicsPipelineMissing()) {
++                    return;
++                }
+                 cmdbuf.DrawIndirectByteCountEXT(1, 0, buffer_obj, offset, 0,
+                                                 static_cast<u32>(stride));
+             });
+@@ -840,9 +849,12 @@ void RasterizerVulkan::DrawIndirect() {
+             if (draw_buffer->SizeBytes() == 0) {
+                 return;
+             }
+-            scheduler.Record([draw_buffer_obj = draw_buffer->Handle(),
++            scheduler.Record([this, draw_buffer_obj = draw_buffer->Handle(),
+                               buffer_obj = buffer->Handle(), offset_base, offset,
+                               params](vk::CommandBuffer cmdbuf) {
++                if (scheduler.GraphicsPipelineMissing()) {
++                    return;
++                }
+                 if (params.is_indexed) {
+                     cmdbuf.DrawIndexedIndirectCount(
+                         buffer_obj, offset, draw_buffer_obj, offset_base,
+@@ -855,7 +867,11 @@ void RasterizerVulkan::DrawIndirect() {
+             });
+             return;
+         }
+-        scheduler.Record([buffer_obj = buffer->Handle(), offset, params](vk::CommandBuffer cmdbuf) {
++        scheduler.Record([this, buffer_obj = buffer->Handle(), offset,
++                          params](vk::CommandBuffer cmdbuf) {
++            if (scheduler.GraphicsPipelineMissing()) {
++                return;
++            }
+             if (params.is_indexed) {
+                 cmdbuf.DrawIndexedIndirect(buffer_obj, offset,
+                                            static_cast<u32>(params.max_draw_counts),
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index ca0ef54a28..e102c82260 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -9,6 +9,7 @@
+ #include <chrono>
+ #include <condition_variable>
+ #include <cstddef>
++#include <cstdlib>
+ #include <functional>
+ #include <memory>
+ #include <thread>
+@@ -38,6 +39,16 @@ class StateTracker;
+ 
+ struct QueryCacheParams;
+ 
++/// EDEN_NX2_PIPELINE_FAIL_SOFT=1: a graphics pipeline that failed to build loses its draws, and the
++/// session goes on. Unset, draws still reach the driver as before.
++[[nodiscard]] inline bool PipelineFailSoft() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_PIPELINE_FAIL_SOFT");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
+ /// The scheduler abstracts command buffer and fence management with an interface that's able to do
+ /// OpenGL-like operations on Vulkan command buffers.
+ class Scheduler {
+@@ -98,6 +109,15 @@ public:
+     /// Update the pipeline to the current execution context.
+     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
+ 
++    /// Worker thread only: whether the bound graphics pipeline failed to build, so the draws
++    /// recorded after it must be dropped instead of reaching the driver without a pipeline.
++    void SetGraphicsPipelineMissing(bool missing) {
++        graphics_pipeline_missing = missing;
++    }
++    [[nodiscard]] bool GraphicsPipelineMissing() const {
++        return graphics_pipeline_missing;
++    }
++
+     /// Update the rescaling state. Returns true if the state has to be updated.
+     bool UpdateRescaling(bool is_rescaling);
+ 
+@@ -347,6 +367,7 @@ private:
+     vk::CommandBuffer current_upload_cmdbuf;
+ 
+     DeferredClear deferred_clear;
++    bool graphics_pipeline_missing{};
+ 
+     std::unique_ptr<CommandChunk> chunk;
+     std::function<void()> on_submit;
