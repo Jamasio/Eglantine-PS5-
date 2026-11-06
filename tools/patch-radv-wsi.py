@@ -167,6 +167,26 @@ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
          '      }\n'
          '      nir->info.internal |= is_internal;'),
     ],
+    # EglantinePS5: the emulated task memory (69 MiB) and the publish ring (16 MiB) are made with the
+    # device whether or not a mesh draw ever comes, and with EDEN_NX2_NO_MESH none does: every use is
+    # in a mesh or task draw (radv_task_emu_begin refuses cleanly without the first). With
+    # EDEN_RADV_NO_MESH_BUFFERS=1 and EDEN_NX2_NO_MESH set (the core's test: set at all), and no
+    # EDEN_NX2_NO_MESH_FILE, which can turn mesh draws back on, they are not made.
+    'src/amd/vulkan/radv_device.c': [
+        ('   /* Zeroed, as every draw packet leaves it; its address goes in a record\'s\n    * 32 bits. */\n'
+         '   if (device->vk.enabled_features.meshShader && radv_mesh_draw_records_enabled(pdev) &&\n',
+         '   const char *const eden_no_mesh_buffers = getenv("EDEN_RADV_NO_MESH_BUFFERS");\n'
+         '   const bool eden_mesh_buffers = !(eden_no_mesh_buffers && eden_no_mesh_buffers[0] == \'1\' &&\n'
+         '                                    getenv("EDEN_NX2_NO_MESH") && !getenv("EDEN_NX2_NO_MESH_FILE"));\n'
+         '   if (!eden_mesh_buffers)\n'
+         '      fprintf(stderr, "radv/ps5: no mesh draws in this run: task memory and publish ring not made\\n");\n\n'
+         '   /* Zeroed, as every draw packet leaves it; its address goes in a record\'s\n    * 32 bits. */\n'
+         '   if (eden_mesh_buffers && device->vk.enabled_features.meshShader && radv_mesh_draw_records_enabled(pdev) &&\n'),
+        ('   /* Its records are read through a 32-bit address. */\n'
+         '   if (device->vk.enabled_features.taskShader && radv_task_emulated(pdev)) {\n',
+         '   /* Its records are read through a 32-bit address. */\n'
+         '   if (eden_mesh_buffers && device->vk.enabled_features.taskShader && radv_task_emulated(pdev)) {\n'),
+    ],
     'src/amd/vulkan/radv_shader_info.c': [
         # Parts of whole primitives that fit one NGG subgroup's 256 vertices: 256 triangles are
         # 4 parts of 64, not 3 of 86 (258 vertices). ac_nir_lower_ngg_mesh derives each part's
