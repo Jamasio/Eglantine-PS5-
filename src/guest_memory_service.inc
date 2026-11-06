@@ -41,6 +41,9 @@ constexpr unsigned FineBackoffMax = 10;
 // dozen 2 MiB pairs that were written apart within a minute, and with it on a large game held 20 FPS
 // instead of 30 (the GPU worker waited for every fence, once a frame) where it held 30 without.
 std::atomic<bool> service_requested{true}, scan_requested{true}, dedup_requested{false}, fine_requested{true};
+// EDEN_CRAM_FREE_RETURN=1: a whole slot the guest's kernel frees goes back then, not when its pages are
+// next handed out (off unless asked for: no build has ever run with it, see GuestMemoryFreed).
+std::atomic<bool> free_return_requested{false};
 std::atomic<SparseRange*> service_range{nullptr}; // the guest range the service runs for
 std::atomic<SparseRange*> probe_range{nullptr};   // the self-test's range
 std::atomic<int> service_state{0};                // 0 not tested, 1 works here, 2 does not
@@ -1780,6 +1783,8 @@ void ServiceStart(SparseRange& range) noexcept {
     }
     ResetCounters();
     range.promote = true;
+    const char* const free_return = std::getenv("EDEN_CRAM_FREE_RETURN");
+    free_return_requested.store(free_return != nullptr && free_return[0] == '1', std::memory_order_relaxed);
     if (const char* pages = std::getenv("EDEN_CRAM_FINE_MIN_PAGES")) {
         const unsigned long asked = std::strtoul(pages, nullptr, 10);
         if (asked >= 1 && asked < FinePages) fine_min_zero_pages = asked;
@@ -1813,10 +1818,12 @@ void ServiceStart(SparseRange& range) noexcept {
     }
 #endif
     char line[128];
-    const int length = std::snprintf(line, sizeof(line), "EDEN_CRAM on: scan=%d dedup=%d fine=%d reserve=%zuMiB fine_min=%zu\n",
+    const int length = std::snprintf(line, sizeof(line),
+                                     "EDEN_CRAM on: scan=%d dedup=%d fine=%d reserve=%zuMiB fine_min=%zu free_return=%d\n",
                                      scan_requested.load() ? 1 : 0, dedup_requested.load() ? 1 : 0,
                                      fine_requested.load() ? 1 : 0,
-                                     reserve_count.load() * (SparseSlot >> 20), fine_min_zero_pages);
+                                     reserve_count.load() * (SparseSlot >> 20), fine_min_zero_pages,
+                                     free_return_requested.load() ? 1 : 0);
     if (length > 0) Report(line);
 }
 
@@ -1951,13 +1958,19 @@ void FillGuestMemory(std::uint8_t* at, int fill, std::size_t bytes) noexcept {
     std::memset(at, fill, bytes);
 }
 
-// The guest's kernel freed pages: every slot they cover whole goes back.
+// The guest's kernel freed pages: every slot they cover whole goes back. KPageHeap::Free calls this
+// with the pool's lock held, also for what is left of a big block it split, so Zero slots are passed
+// over without their lock. Until EDEN_CRAM_FREE_RETURN a freed slot stays Own until the kernel hands
+// its pages out again (ClearGuestMemory, returns_clear).
 void GuestMemoryFreed(std::uint64_t offset, std::size_t bytes) noexcept {
     SparseRange* const range = guest_range.load(std::memory_order_acquire);
-    if (range == nullptr || !range->promote || bytes < SparseSlot) return;
+    if (range == nullptr || !range->promote || bytes < SparseSlot ||
+        !free_return_requested.load(std::memory_order_relaxed))
+        return;
     const std::uint64_t first = (offset + SparseSlot - 1) / SparseSlot;
     const std::uint64_t last = (offset + bytes) / SparseSlot; // exclusive
     for (std::uint64_t slot = first; slot < last; ++slot) {
+        if (SlotState(*range, static_cast<std::size_t>(slot)) == SlotZero) continue;
         LockSlot(*range, static_cast<std::size_t>(slot));
         if (SlotState(*range, static_cast<std::size_t>(slot)) != SlotZero) {
             ReturnSlot(*range, static_cast<std::size_t>(slot));

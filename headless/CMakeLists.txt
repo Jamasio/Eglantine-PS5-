@@ -1946,10 +1946,13 @@ string(REPLACE "${page_heap_free_site}"
     page_heap_source "${page_heap_source}")
 string(PREPEND page_heap_source "#include <cstddef>\n#include <cstdint>\n#include \"core/device_memory.h\"\nnamespace Common { void GuestMemoryFreed(std::uint64_t offset, std::size_t bytes) noexcept; }\n")
 write_derived("${PORT_BUILD_DIR}/k_page_heap.cpp" "${page_heap_source}")
-get_target_property(pool_core_sources core SOURCES)
-list(REMOVE_ITEM pool_core_sources hle/kernel/k_memory_manager.cpp hle/kernel/k_page_heap.cpp)
-list(APPEND pool_core_sources "${PORT_BUILD_DIR}/k_memory_manager.cpp" "${PORT_BUILD_DIR}/k_page_heap.cpp")
-set_property(TARGET core PROPERTY SOURCES "${pool_core_sources}")
+# Into core_sources, which already holds this section's kernel.cpp. These files used to go through a
+# list of their own that the next line replaced with core_sources: both copies were written and never
+# built, KPageHeap::Free never called GuestMemoryFreed, and every log says returns_free=0. The page
+# heap's copy goes in now (it does nothing unless EDEN_CRAM_FREE_RETURN=1). The memory manager's stays
+# out: with the service on its one live call returns at once, and with it off it would change a build.
+list(REMOVE_ITEM core_sources hle/kernel/k_page_heap.cpp)
+list(APPEND core_sources "${PORT_BUILD_DIR}/k_page_heap.cpp")
 set_property(TARGET core PROPERTY SOURCES "${core_sources}")
 
 # Replace SDL audio with the optional native sink; the renderer stays null.
