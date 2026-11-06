@@ -1,0 +1,86 @@
+From: Gavin Schiller <gavinschiller51@gmail.com>
+Subject: [PATCH] texture_cache: land deferred clears before non-pass image writes
+
+Core patch, for tools/eglantine-patches as 0191.
+
+Port of zortos293/Lichii PR 185 (vouion, 99c5b39c9e, open there). A deferred clear
+waits for its framebuffer's next render pass, but copies bypass render passes, so
+a clear parked before a blit landed after it and wiped it. Ocarina's terrain layer
+read that wiped depth (Lichii issue 101). BlitImage, CopyImage and PrepareDmaImage
+now realize a parked clear first.
+
+Switch: EDEN_NX2_CLEAR_BEFORE_COPY=1, ours; the source has none. Default off. The
+layer that showed it is a mesh draw, which EDEN_NX2_NO_MESH skips here, so expect
+no change on the console until mesh draws run.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+  src/video_core/texture_cache/texture_cache.h  | 19 +++++++++++++++++++
+  .../texture_cache/texture_cache_base.h        |  3 +++
+  2 files changed, 22 insertions(+)
+
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 5b4c057a4f..a514b7dc78 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -996,6 +996,17 @@ ImageViewId TextureCache<P>::VisitImageView(u32 index, bool compute) {
+     return id;
+ }
+ 
++template <class P>
++void TextureCache<P>::LandDeferredClearBeforeCopy() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_NX2_CLEAR_BEFORE_COPY");
++        return value != nullptr && value[0] != '0';
++    }();
++    if (enabled) {
++        runtime.FlushDeferredClear();
++    }
++}
++
+ template <class P>
+ FramebufferId TextureCache<P>::GetFramebufferId(const RenderTargets& key) {
+     const auto [pair, is_new] = framebuffers.try_emplace(key);
+@@ -1175,6 +1186,12 @@ template <class P>
+ bool TextureCache<P>::BlitImage(const Tegra::Engines::Fermi2D::Surface& dst,
+                                 const Tegra::Engines::Fermi2D::Surface& src,
+                                 const Tegra::Engines::Fermi2D::Config& copy) {
++    // A deferred clear parked before this copy has to land before it: realized afterwards, its
++    // clear pass starts after the copy and wipes what the copy wrote. Ocarina of Time clears an
++    // occlusion depth, blits the scene depth over it and reads it during a later draw (Lichii
++    // issue 101). GetFramebufferId only flushes when it creates a framebuffer, so this starts on
++    // the second frame. EDEN_NX2_CLEAR_BEFORE_COPY=1 turns it on.
++    LandDeferredClearBeforeCopy();
+     const auto result = GetBlitImages(dst, src, copy);
+     if (!result) {
+         return false;
+@@ -3482,6 +3499,7 @@ ImageId TextureCache<P>::FindDMAImage(const ImageInfo& info, GPUVAddr gpu_addr)
+ template <class P>
+ std::pair<u32, u32> TextureCache<P>::PrepareDmaImage(ImageId dst_id, GPUVAddr base_addr,
+                                                      bool mark_as_modified) {
++    LandDeferredClearBeforeCopy(); // As in BlitImage
+     const auto& image = slot_images[dst_id];
+     const auto base = image.TryFindBase(base_addr);
+     PrepareImage(dst_id, mark_as_modified, false);
+@@ -4208,6 +4226,7 @@ void TextureCache<P>::PrepareImageView(ImageViewId image_view_id, bool is_modifi
+ 
+ template <class P>
+ void TextureCache<P>::CopyImage(ImageId dst_id, ImageId src_id, std::vector<ImageCopy> copies) {
++    LandDeferredClearBeforeCopy(); // As in BlitImage
+     Image& dst = slot_images[dst_id];
+     Image& src = slot_images[src_id];
+     if (True(dst.flags & ImageFlagBits::UnwrittenSparse) ||
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 92641171f1..8a105cc1ab 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -417,6 +417,9 @@ private:
+     /// Find or create a framebuffer with the given render target parameters
+     FramebufferId GetFramebufferId(const RenderTargets& key);
+ 
++    /// A parked deferred clear lands before a copy into an image (EDEN_NX2_CLEAR_BEFORE_COPY=1)
++    void LandDeferredClearBeforeCopy();
++
+     /// Refresh the contents (pixel data) of an image
+     [[nodiscard]] bool IsDownloadable(const ImageBase& image) const noexcept;
+ 
