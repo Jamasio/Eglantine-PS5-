@@ -147,6 +147,32 @@ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
                                PS5_KERNEL_PROT_GPU_WRITE) == 0;
 }''', (root/'tools/radv-host-memory.inc').read_text().strip()),
         ('   if (!placed) {', '   if (!placed) {\n      fprintf(stderr, "radv/ps5: mapping rejected result=%d address=%p bytes=%llu window32=%d\\n", result, address, (unsigned long long)bytes, window32);'),
+        # EglantinePS5: Mario Kart World on next16 was refused a 343 MiB image with 1886 MiB free
+        # in one piece. The direct memory was allocated and the kernel refused to map it, and the
+        # sparse range had been refused before that without a word. These say which step it was: no
+        # granules in a row, or the kernel (with its result) at the address asked for.
+        ('   int32_t result = sceKernelMapDirectMemory(&address, bytes, RADV_PS5_PROTECTION, 0, physical, alignment);\n   if (result != 0 && hint != NULL) {',
+         '   int32_t result = sceKernelMapDirectMemory(&address, bytes, RADV_PS5_PROTECTION, 0, physical, alignment);\n'
+         '   if (result != 0)\n'
+         '      fprintf(stderr, "radv/ps5: mapping of %llu bytes at %p refused: 0x%08x (at 0: no %u granules in a row)\\n",\n'
+         '              (unsigned long long)bytes, hint, (unsigned)result, (unsigned)DIV_ROUND_UP(bytes, RADV_PS5_LARGE_BYTES));\n'
+         '   if (result != 0 && hint != NULL) {'),
+        ('   void *address = at;\n   return sceKernelMapDirectMemory(&address, bytes, RADV_PS5_PROTECTION, PS5_KERNEL_MAP_FIXED, physical,\n'
+         '                                   RADV_PS5_PAGE_BYTES) == 0 &&\n          address == at;',
+         '   void *address = at;\n'
+         '   const int32_t result = sceKernelMapDirectMemory(&address, bytes, RADV_PS5_PROTECTION, PS5_KERNEL_MAP_FIXED, physical,\n'
+         '                                                   RADV_PS5_PAGE_BYTES);\n'
+         '   static uint32_t reported;\n'
+         '   if (result != 0 && p_atomic_inc_return(&reported) <= 16)\n'
+         '      fprintf(stderr, "radv/ps5: fixed mapping of %llu bytes at %p refused: 0x%08x\\n", (unsigned long long)bytes,\n'
+         '              (void *)at, (unsigned)result);\n'
+         '   return result == 0 && address == at;'),
+        ('      if (granule == UINT32_MAX)\n         return false;\n   }\n   uint8_t *const va = (uint8_t *)(uintptr_t)(RADV_PS5_REGION_BASE + (uint64_t)granule * RADV_PS5_LARGE_BYTES);',
+         '      if (granule == UINT32_MAX) {\n'
+         '         fprintf(stderr, "radv/ps5: sparse range of %u granules refused: none free in a row\\n", (unsigned)granules);\n'
+         '         return false;\n'
+         '      }\n'
+         '   }\n   uint8_t *const va = (uint8_t *)(uintptr_t)(RADV_PS5_REGION_BASE + (uint64_t)granule * RADV_PS5_LARGE_BYTES);'),
         # EglantinePS5: every out-of-memory ending left 60 to 240 MiB free in 100 to 450 pieces, in most
         # runs nearly all under 2 MiB (40-53), and the pieces fallback takes only whole 2 MiB blocks, so a
         # 16 MiB buffer was refused with 125 MiB free. When no 2 MiB block is left it now takes what
