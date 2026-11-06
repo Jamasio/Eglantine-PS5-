@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 port
+Date: Fri, 6 Nov 2026 18:00:00 +0100
+Subject: [PATCH] Scheduler: EDEN_NX2_END_FAIL_SOFT=1 drops a command buffer the driver cannot end
+
+Core patch on the T28 core (t27core, through 0413); applies with git apply on
+src/video_core/renderer_vulkan/vk_scheduler.cpp. Off unless asked for.
+
+Run 102 (Mario Kart, T27, the run 101 env): at the course load, 195 s, vkEndCommandBuffer answered
+VK_ERROR_OUT_OF_DEVICE_MEMORY (report: vulkan_wrapper.h:1274 End x1). vk::Check threw, nothing on the
+worker thread caught it, and the app stopped itself with the pool at 0 MiB largest. Run 101 crossed
+the same shortage 30 s earlier in its menus and raced for 77 s more with images refused and unbacked.
+The bad_alloc fallbacks (0181) cover pipelines and uploads, not this.
+
+With the switch the two command buffers that failed are dropped, two empty ones carry the signal and
+wait semaphores, and the tick is submitted as before, so every wait on it completes. The dropped
+buffer's draws, uploads and downloads are lost: a wrong frame, and a download that leaves stale bytes
+in the guest's memory, are possible. The pool is still empty afterwards; this only turns a sure end
+into the state run 101 lived in. The log says "Command buffer could not be ended" with a count.
+
+Syntax-checked with clang -fsyntax-only against the T28 core and the port's deps. Not built, not run.
+---
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -523,8 +523,41 @@
+             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+         };
+         upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WRITE_BARRIER);
+-        upload_cmdbuf.End();
+-        cmdbuf.End();
++        // EDEN_NX2_END_FAIL_SOFT=1: a command buffer the driver cannot end is dropped instead of
++        // ending the session. Run 102 (Mario Kart, T27): vkEndCommandBuffer answered
++        // VK_ERROR_OUT_OF_DEVICE_MEMORY at the course load, the exception left the worker thread,
++        // and the app stopped itself; run 101 lived through the same shortage and raced. Two empty
++        // buffers carry the semaphores, so every wait on this tick still completes. The dropped
++        // buffer's draws, uploads and downloads are lost: a wrong frame, and a readback that
++        // brings stale bytes to the guest, are possible. Off unless asked for.
++        static const bool end_fail_soft = [] {
++            const char* const value = std::getenv("EDEN_NX2_END_FAIL_SOFT");
++            return value != nullptr && value[0] == '1';
++        }();
++        try {
++            upload_cmdbuf.End();
++            cmdbuf.End();
++        } catch (const vk::Exception& exception) {
++            if (!end_fail_soft) {
++                throw;
++            }
++            static u32 dropped{};
++            LOG_ERROR(Render_Vulkan, "Command buffer could not be ended ({}): its work is dropped, tick {} is signalled empty ({} so far)",
++                      exception.what(), signal_value, ++dropped);
++            static constexpr VkCommandBufferBeginInfo EMPTY_BEGIN{
++                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
++                .pNext = nullptr,
++                .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
++                .pInheritanceInfo = nullptr,
++            };
++            // The pool resets a buffer when it begins again, so the two that failed need nothing.
++            upload_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
++            upload_cmdbuf.Begin(EMPTY_BEGIN);
++            upload_cmdbuf.End();
++            cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
++            cmdbuf.Begin(EMPTY_BEGIN);
++            cmdbuf.End();
++        }
+ 
+         if (on_submit) {
+             on_submit();

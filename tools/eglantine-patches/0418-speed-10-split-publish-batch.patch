@@ -1,0 +1,96 @@
+From cae31a6c09fce517e1bbfdcd375e73264dff1054 Mon Sep 17 00:00:00 2001
+From: EglantinePS5
+Date: Fri, 6 Nov 2026 16:15:07 +0100
+Subject: [PATCH] video_core: EDEN_NX2_SPLIT_PUBLISH, smaller batches between
+ the split's front and back
+
+Run108 (EDEN_NX2_SPLIT_WAITS=1): the front waited 407 to 423 ms a second for the back, 750 times
+a frame (list writers 5100/s, semaphore acquires 9500/s, macro DMA reads 5750/s), and the back
+sat idle 392 to 410 ms a second. The two never overlap: the front works, then waits for what it
+just sent; the back runs that and idles until the next batch. Each wait is a data dependency
+(a command list on pages queued work may write, a semaphore word a queued release may change, a
+macro's memory read), and behind most of them the back itself waits for the GPU (vkWaitSemaphores
+1344 ms per 5 s, 85 a frame; the present fence 598 ms). Those are not touched here.
+
+What this changes is when the back is told. The front commits ring entries and publishes them in
+batches that grow from 8 to 256 words between waits (about 90 us of the front's output at the
+2.9 million words a second of that run), and the back parks after 8192 pauses with nothing to do,
+so the next batch costs a wake. EDEN_NX2_SPLIT_PUBLISH=<words> (1 to 256) caps the batch; the ramp
+after a drain starts at min(8, cap). Unset: 256, as before. Ordering is unchanged: the back still
+executes entries in ring order and the front still waits at the same sites for the same targets,
+so no read can become stale and no GPU command moves. The cost is one seq_cst store per batch and
+more wakes while the back parks; the gain is bounded by the batch latency and the wake latency,
+not by the GPU waits: a few milliseconds a frame at most on run108's numbers.
+
+Clang syntax check clean on gpu_split.cpp and dma_pusher.cpp. Not built, not run.
+---
+ src/video_core/gpu_split.cpp | 15 ++++++++++++---
+ src/video_core/gpu_split.h   |  7 +++++++
+ 2 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index a41f56f..b3e0b13 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -187,7 +187,7 @@ void GpuSplit::Stop() {
+     late_pages.clear();
+     published_local = 0;
+     consumed_cache = 0;
+-    publish_every = PublishEvery;
++    publish_every = PublishCap();
+     front_engine = nullptr;
+     back_engine = nullptr;
+     front_macros = false;
+@@ -223,12 +223,21 @@ void GpuSplit::WaitForSpace(size_t words) {
+     WaitFor(write_position + words - RingWords, DrainSite::RingFull);
+ }
+ 
++size_t GpuSplit::PublishCap() {
++    static const size_t cap = [] {
++        const char* const value = std::getenv("EDEN_NX2_SPLIT_PUBLISH");
++        const unsigned long words = value != nullptr ? std::strtoul(value, nullptr, 10) : 0;
++        return words >= 1 && words <= PublishEvery ? static_cast<size_t>(words) : PublishEvery;
++    }();
++    return cap;
++}
++
+ void GpuSplit::Publish() {
+     if (published_local == write_position) {
+         return;
+     }
+     published_local = write_position;
+-    publish_every = std::min<size_t>(publish_every * 2, PublishEvery);
++    publish_every = std::min<size_t>(publish_every * 2, PublishCap());
+     published.store(write_position, std::memory_order_seq_cst);
+     if (back_waiting.load(std::memory_order_seq_cst)) {
+         wake.fetch_add(1, std::memory_order_seq_cst);
+@@ -261,7 +270,7 @@ void GpuSplit::Drain() {
+         consumed_cache = consumed.load(std::memory_order_acquire);
+         if (consumed_cache == write_position) {
+             if (BackQuiet()) {
+-                publish_every = 8;
++                publish_every = std::min<size_t>(8, PublishCap());
+                 return;
+             }
+             if (!hook_asked) {
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index 03eccbb..450f88f 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -283,6 +283,13 @@ private:
+     static constexpr size_t RingMask = RingWords - 1;
+     static constexpr u32 MaxMultiWords = 8192;
+     static constexpr size_t PublishEvery = 256;
++    /// EDEN_NX2_SPLIT_PUBLISH=<words> (1 to 256; unset: 256): the most words the front commits
++    /// before the back is told. The back can only overlap the front's work it has been told
++    /// about, and the front tells it in batches that grow to this many words between waits:
++    /// run108's front waited 750 times a frame, each time for the batch it had just sent, with
++    /// the back idle 40% of the time between batches. Smaller batches start the back sooner at
++    /// the cost of one seq_cst store, and a wake when it parked, per batch.
++    static size_t PublishCap();
+     static constexpr u32 PendingWriteWords = 8;
+     static constexpr u64 PendingWriteCount = 8192;
+     struct PendingWrite {
+-- 
+2.54.0
+

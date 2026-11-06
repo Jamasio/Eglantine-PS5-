@@ -10,6 +10,7 @@
 #include <string>
 #include <set>
 #include <cerrno>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cpuid.h>
@@ -504,6 +505,51 @@ static void ReportLedger() {
 #endif
 
 #ifdef PS5_NATIVE
+// EDEN_MEMORY_REPORT_THREAD=1: the low-memory burst report and the heap trim run on a thread of
+// their own instead of the GPU thread (RefreshFreeMemory below). The report only reads the
+// service's slot table, which its own keeper and scanner threads change under it today too, and
+// the heap trim takes the allocator's locks like any free; neither needs the GPU thread. One
+// worker, started at the first request, never joined: the process ends with _exit.
+static bool OffThreadReportsEnabled() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("EDEN_MEMORY_REPORT_THREAD");
+        return value != nullptr && value[0] != '0';
+    }();
+    return enabled;
+}
+void RegisterWorker(const char* name);
+static void QueueOffThreadReport(bool report, bool trim) {
+    struct Pending {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool report{}, trim{}, started{};
+    };
+    static Pending* const pending = new Pending;  // outlives every static destructor
+    {
+        std::scoped_lock lock{pending->mutex};
+        pending->report |= report;
+        pending->trim |= trim;
+        if (!pending->started) {
+            pending->started = true;
+            std::thread([] {
+                RegisterWorker("MemoryReport");
+                for (;;) {
+                    bool do_report, do_trim;
+                    {
+                        std::unique_lock lock{pending->mutex};
+                        pending->changed.wait(lock, [] { return pending->report || pending->trim; });
+                        do_report = pending->report;
+                        do_trim = pending->trim;
+                        pending->report = pending->trim = false;
+                    }
+                    if (do_report && eden_guest_memory_report) eden_guest_memory_report();
+                    if (do_trim) TrimHeap("the pool is short");
+                }
+            }).detach();
+        }
+    }
+    pending->changed.notify_one();
+}
 // The largest free block of direct memory is what the next graphics allocation needs. Looked at
 // again every 100 ms; called on the GPU thread by the texture collector (KeepDirtyTextures).
 static std::atomic<unsigned long long> largest_free_block{0};
@@ -547,16 +593,25 @@ static void RefreshFreeMemory() {
     // The last burst of a session falls between two reports of the guest's memory (every 30 s):
     // who wrote it, while the pool's largest block is nearly gone (every 5 s at most).
     static std::atomic<long long> burst_ns{0};
-    if (known && largest < (std::size_t{256} << 20) && eden_guest_memory_report &&
-        now - burst_ns.load(std::memory_order_relaxed) >= 5'000'000'000) {
-        burst_ns.store(now, std::memory_order_relaxed);
-        eden_guest_memory_report();
-    }
+    const bool burst_due = known && largest < (std::size_t{256} << 20) && eden_guest_memory_report &&
+                           now - burst_ns.load(std::memory_order_relaxed) >= 5'000'000'000;
+    if (burst_due) burst_ns.store(now, std::memory_order_relaxed);
     // The heap's empty spaces go back to the pool while it is short (every 2 s at most).
     static std::atomic<long long> trimmed_ns{0};
-    if (view.short_memory && now - trimmed_ns.load(std::memory_order_relaxed) >= 2'000'000'000) {
-        trimmed_ns.store(now, std::memory_order_relaxed);
-        TrimHeap("the pool is short");
+    const bool trim_due = view.short_memory && now - trimmed_ns.load(std::memory_order_relaxed) >= 2'000'000'000;
+    if (trim_due) trimmed_ns.store(now, std::memory_order_relaxed);
+    // EDEN_MEMORY_REPORT_THREAD=1 (env.txt): both run on their own thread. This function runs on
+    // the GPU thread (the texture collector asks for the free memory), and the burst report walks
+    // every slot of the guest's memory: with the pool short, run108 had a 120 to 134 ms frame in
+    // nearly every 5 s window where the clean stretch had 44 to 52 ms, and the frame rate fell from
+    // 27 to 19 to 24. Off: as before, on the calling thread.
+    if (burst_due || trim_due) {
+        if (OffThreadReportsEnabled()) {
+            QueueOffThreadReport(burst_due, trim_due);
+        } else {
+            if (burst_due) eden_guest_memory_report();
+            if (trim_due) TrimHeap("the pool is short");
+        }
     }
 }
 // A write to the guest's memory waiting for a block (src/guest_memory_service.inc, WaitForBlock): the game's own
