@@ -129,6 +129,7 @@ extern "C" bool eden_jit_shared;  // headless/dynarmic/jit_group_support.inc
 #include "profiles.h"
 #include "stop_limit.h"
 #include "test_harness.h"
+extern "C" bool eden_page_reuse;  // headless/dynarmic/page_reuse_pass.inc
 namespace Common {
 void SetGuestMemoryFine(bool on) noexcept;
 bool SparseTablesAvailable() noexcept; // src/memory_pages.cpp
@@ -566,6 +567,10 @@ int main(int argc, char** argv) {
                                           std::pair{"EDEN_NX2_UNBACKED_LIMIT", "0"}}) {
             setenv(name, value, 0);
         }
+        // Nearby A64 accesses share one page lookup (headless/dynarmic/page-reuse.cmake). The pass
+        // only acts on the direct table, EDEN_JIT_TABLE=1.
+        if (const char* const reuse = std::getenv("EDEN_JIT_PAGE_REUSE"); reuse && reuse[0] == '1')
+            eden_page_reuse = true;
         // Where a frame goes, from a normal build (performance.h, perf_report).
         if (const char* const report = std::getenv("EDEN_PERF_REPORT"); report && report[0] == '1') {
             Eden::Performance::perf_report = true;
