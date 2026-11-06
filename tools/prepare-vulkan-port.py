@@ -977,6 +977,46 @@ adapt('src/video_core/vulkan_common/vulkan_device.cpp', 'vulkan_device.cpp', [
 # Development GPU fault probe (dev_vulkan.h, submit_sync=on): wait for every
 # submission, so the CPU never records against work the GPU has not finished.
 GPU_TIME_HELPERS = (port / 'gpu_time_probe.inc').read_text()
+# EDEN_NX2_END_FAIL_SOFT=1: a command buffer the driver cannot end is dropped instead of ending
+# the session. Run 102 (Mario Kart, T27): vkEndCommandBuffer answered VK_ERROR_OUT_OF_DEVICE_MEMORY
+# at the course load, the exception left the worker thread, and the app stopped itself; run 101
+# lived through the same shortage and raced. Two empty buffers carry the semaphores, so every wait
+# on the tick completes. The dropped buffer's draws, uploads and downloads are lost: a wrong frame,
+# and a readback that brings stale bytes to the guest, are possible. Off unless asked for.
+END_FAIL_SOFT_HELPERS = """
+void EndCommandBuffersOrDrop(vk::CommandBuffer& upload_cmdbuf, vk::CommandBuffer& cmdbuf,
+                             CommandPool& command_pool, const Device& device, u64 signal_value) {
+    static const bool end_fail_soft = [] {
+        const char* const value = std::getenv("EDEN_NX2_END_FAIL_SOFT");
+        return value != nullptr && value[0] == '1';
+    }();
+    try {
+        upload_cmdbuf.End();
+        cmdbuf.End();
+        return;
+    } catch (const vk::Exception& exception) {
+        if (!end_fail_soft) {
+            throw;
+        }
+        static u32 dropped{};
+        LOG_ERROR(Render_Vulkan, "Command buffer could not be ended ({}): its work is dropped, tick {} is signalled empty ({} so far)",
+                  exception.what(), signal_value, ++dropped);
+    }
+    static constexpr VkCommandBufferBeginInfo EMPTY_BEGIN{
+        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+        .pNext = nullptr,
+        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+        .pInheritanceInfo = nullptr,
+    };
+    // The pool resets a buffer when it begins again, so the two that failed need nothing.
+    upload_cmdbuf = vk::CommandBuffer(command_pool.Commit(), device.GetDispatchLoader());
+    upload_cmdbuf.Begin(EMPTY_BEGIN);
+    upload_cmdbuf.End();
+    cmdbuf = vk::CommandBuffer(command_pool.Commit(), device.GetDispatchLoader());
+    cmdbuf.Begin(EMPTY_BEGIN);
+    cmdbuf.End();
+}
+"""
 # Keep command availability separate from queue-drain completion. Only the worker
 # waits on event_cv; WaitWorker waits on drain_cv under the same queue mutex.
 adapt('src/video_core/renderer_vulkan/vk_scheduler.h',
@@ -997,7 +1037,7 @@ adapt('src/video_core/renderer_vulkan/vk_scheduler.cpp', 'vulkan_scheduler.cpp',
      '        work_queue.pop();\n        if (!eden_vulkan_handoff_enabled() || (work_queue.empty() && drain_waiters)) drain_cv.notify_all();'),
 
     ('#include <memory>', '#include <memory>\n#include <array>\n#include <chrono>\n#include <cstdio>\n#include "dev_vulkan.h"\n#include "submission_origin.h"\nextern "C" bool eden_vulkan_handoff_enabled();'),
-    ('namespace Vulkan {\n', 'namespace Vulkan {\n' + GPU_TIME_HELPERS),
+    ('namespace Vulkan {\n', 'namespace Vulkan {\n' + GPU_TIME_HELPERS + END_FAIL_SOFT_HELPERS),
     ('        .pInheritanceInfo = nullptr,\n    });\n}\n\nu64 Scheduler::SubmitExecution(',
      '        .pInheritanceInfo = nullptr,\n    });\n    GpuTimeBegin(device, current_upload_cmdbuf);\n}\n\nu64 Scheduler::SubmitExecution('),
     ('u64 Scheduler::Flush(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {',
@@ -1009,8 +1049,11 @@ adapt('src/video_core/renderer_vulkan/vk_scheduler.cpp', 'vulkan_scheduler.cpp',
     ('    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,',
      '    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,\n'
      '                            submit_origin = gpu_submit_origin,'),
-    ('        cmdbuf.End();\n\n        if (on_submit)',
-     '        GpuTimeEnd(cmdbuf);\n        cmdbuf.End();\n\n        if (on_submit)'),
+    # EDEN_NX2_END_FAIL_SOFT (END_FAIL_SOFT_HELPERS): both ends go through the helper.
+    ('        upload_cmdbuf.End();\n        cmdbuf.End();\n\n        if (on_submit)',
+     '        GpuTimeEnd(cmdbuf);\n'
+     '        EndCommandBuffersOrDrop(upload_cmdbuf, cmdbuf, *command_pool, device, signal_value);\n\n'
+     '        if (on_submit)'),
     ('            vk::Check(result);\n            break;\n        }\n    });\n    chunk->MarkSubmit();',
      '            vk::Check(result);\n            break;\n        }\n'
      '        GpuTimeCountOrigin(submit_origin);\n        GpuTimeCollect(device);\n    });\n    chunk->MarkSubmit();'),
