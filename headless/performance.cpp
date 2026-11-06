@@ -174,18 +174,34 @@ void CheckWorkerTopology() {
     std::array<unsigned, 5> cores{};
     unsigned count = 0;
     bool changed = false;
+    // Why a probe stopped short (EDEN_WORKER_PROBE): every run on firmware 12.40 reports one
+    // distinct core, so nothing is pinned there and the log has never said why.
+    unsigned probed = 0, stopped_at = 64, shift = 0, first_id = 0, last_id = 0;
+    int refused = 0;
+    bool bad_level = false;
     for (unsigned cpu = 0; cpu < 64; ++cpu) {
         if (!CPU_ISSET(cpu, &original)) continue;
         cpuset_t one{};
         CPU_SET(cpu, &one);
-        if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &one)) break;
+        if (cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &one)) {
+            refused = errno;
+            stopped_at = cpu;
+            break;
+        }
         changed = true;
         unsigned a, b, c, d;
         __cpuid_count(0xb, 0, a, b, c, d);
         // Architectural SMT level: x2APIC ID above the SMT shift identifies
         // the physical core. Do not assume OS CPU numbering matches APIC IDs.
-        if (!b || ((c >> 8) & 0xff) != 1 || (a & 31) >= 16) break;
+        if (!b || ((c >> 8) & 0xff) != 1 || (a & 31) >= 16) {
+            bad_level = true;
+            stopped_at = cpu;
+            break;
+        }
         const unsigned core = d >> (a & 31);
+        if (probed++ == 0) first_id = d;
+        last_id = d;
+        shift = a & 31;
         cpu_core[cpu] = static_cast<int>(core);
         if (count == cores.size() ||
             std::find(cores.begin(), cores.begin() + count, core) != cores.begin() + count) continue;
@@ -198,6 +214,29 @@ void CheckWorkerTopology() {
             cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, 8, &restored) ||
             std::memcmp(&original, &restored, 8))
             throw std::runtime_error("Cannot restore topology-probe thread affinity");
+    }
+    unsigned long long allowed_mask = 0;
+    for (unsigned cpu = 0; cpu < 64; ++cpu)
+        if (CPU_ISSET(cpu, &original)) allowed_mask |= 1ULL << cpu;
+    std::printf("EDEN_WORKER_PROBE allowed=%llx probed=%u stopped_at=%u refused=%d bad_level=%d shift=%u "
+                "first_id=%u last_id=%u\n", allowed_mask, probed, stopped_at, refused, int(bad_level), shift,
+                first_id, last_id);
+    // EDEN_PS5_PIN=pairs: when the probe found too few cores, take CPUs 2n and 2n+1 as one core's
+    // two threads (the layout tools/check-worker-affinity.py models) and pin as a console that
+    // passes the probe does. Off by default: the layout is an assumption, not a reading.
+    const char* const pin = std::getenv("EDEN_PS5_PIN");
+    if (count != cores.size() && pin != nullptr && std::strcmp(pin, "pairs") == 0) {
+        count = 0;
+        cpu_core.fill(-1);
+        for (unsigned cpu = 0; cpu < 64; ++cpu) {
+            if (!CPU_ISSET(cpu, &original)) continue;
+            const unsigned core = cpu / 2;
+            cpu_core[cpu] = static_cast<int>(core);
+            if (count == cores.size() ||
+                std::find(cores.begin(), cores.begin() + count, core) != cores.begin() + count) continue;
+            cores[count] = core;
+            worker_cpus[count++] = cpu;
+        }
     }
     worker_topology_ready = count == cores.size();
     topology_allowed = original;
@@ -259,9 +298,13 @@ void PlaceSecondary(const char* name) {
         std::printf("EDEN_WORKER_PLACED name=%s mask=%llx error=%d\n", name, cpus, result ? errno : 0);
 }
 void PinWorker(unsigned index, cpuset_t& affinity) {
-    if (!worker_topology_ready || index >= worker_cpus.size()) return;
+    if (index >= worker_cpus.size()) return;
+    // EDEN_PS5_PLACE names a CPU itself, so it needs no topology (ready=0 made it do nothing for
+    // CPUCore_0-3 and GPU, while it did work for every other thread).
+    const unsigned long long over = PlacementOverride(names[index]);
+    if (!worker_topology_ready && over == 0) return;
     unsigned cpu = worker_cpus[index];
-    if (const unsigned long long over = PlacementOverride(names[index]); over != 0) {
+    if (over != 0) {
         cpu = static_cast<unsigned>(__builtin_ctzll(over));
     }
     if (!CPU_ISSET(cpu, topology_allowed_valid ? &topology_allowed : &affinity)) return;
