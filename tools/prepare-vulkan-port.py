@@ -588,6 +588,19 @@ extern "C" void eden_vma_probe(unsigned seconds) {
     std::lock_guard lock{vma_probe_mutex};
     if (vma_probe_allocator) EdenVmaSnapshot(vma_probe_allocator, 100000 + seconds);
 }
+// The budget's figures: atomics and no walk of the blocks, so any thread may ask, a refused one too.
+// The allocator is externally synchronized: past 30 operations this also refreshes its budget,
+// plain fields written without a lock, which the next refresh writes over.
+extern "C" void eden_vma_usage(unsigned long long* blocks, unsigned long long* used) {
+    std::lock_guard lock{vma_probe_mutex};
+    if (!vma_probe_allocator) return;
+    VmaBudget held[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(vma_probe_allocator, held);
+    for (const VmaBudget& heap : held) {
+        *blocks += heap.statistics.blockBytes;
+        *used += heap.statistics.allocationBytes;
+    }
+}
 MemoryAllocator::MemoryAllocator(const Device &device_)'''),
     ('    // Preserve the previous "RenderDoc small heap"',
      '    { std::lock_guard lock{vma_probe_mutex}; vma_probe_allocator = allocator; }\n'

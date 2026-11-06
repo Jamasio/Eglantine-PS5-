@@ -79,6 +79,10 @@ if [[ -f $radv_release/lib/libvulkan_radeon.ps5.a ]]; then
         step "RADV: the display code's adaptation changed"
         bash tools/build-radv-dependencies.sh
         rm -f build/radv-isolated/libvulkan_radeon.ps5.a
+    elif ! python3 -B tools/patch-radv-memory-report.py --check "$radv_release/EDEN_MEMORY_REPORT_SHA256"; then
+        step "RADV: the memory report changed"
+        bash tools/build-radv-dependencies.sh
+        rm -f build/radv-isolated/libvulkan_radeon.ps5.a
     fi
 fi
 if [[ ! -f build/radv-isolated/libvulkan_radeon.ps5.a ]]; then

@@ -406,6 +406,13 @@ struct DirectMemoryRegion { std::int64_t start; std::int64_t end; std::int32_t t
 extern "C" std::int32_t sceKernelDirectMemoryQuery(std::int64_t, int, DirectMemoryRegion*, std::size_t);
 extern "C" std::int32_t sceKernelAvailableFlexibleMemorySize(std::size_t*);
 extern "C" void eden_direct_ledger(unsigned long long* bytes, unsigned long long* blocks) __attribute__((weak));
+// The allocator's blocks and what is in use of them (vulkan_memory_allocator.cpp).
+extern "C" void eden_vma_usage(unsigned long long* blocks, unsigned long long* used) __attribute__((weak));
+#ifdef EDEN_PS5_RADV
+// The driver's own line (tools/patch-radv-memory-report.py), by the name isolate-radv.py gives it.
+// Not weak: a driver built without it stops the link here, not the package check (check_package.py).
+extern "C" void eden_radv_private_radv_ps5_memory_report_now(void);
+#endif
 // What is out of the pool by size (src/direct_memory.c) beside what the owners say they hold, and
 // what the second pool has left: the flexible size in sce_sys/param.json is decided from this line
 // (the same call as ProsperoEden's launch line). A release build imports one more kernel function.
@@ -425,6 +432,20 @@ static void ReportLedger() {
                  bytes[0] >> 20, blocks[0], bytes[1] >> 20, blocks[1], bytes[2] >> 20, blocks[2], bytes[3] >> 20, blocks[3],
                  guest >> 20, reserve >> 20, (eden_heap_committed ? eden_heap_committed() : std::size_t{0}) >> 20,
                  code >> 20, tables >> 20, known ? static_cast<long long>(flexible >> 20) : -1LL);
+    // RADV_PS5_MEMORY_REPORT=1: out of the pool, less the owners above, less this, is the driver's
+    // own buffers and the rest, every 20 s and not only at a refusal. Without it nothing here runs:
+    // this is on the GPU thread, and the question below can refresh the allocator's budget.
+    const char* const memory_report = std::getenv("RADV_PS5_MEMORY_REPORT");
+    if (memory_report && memory_report[0] == '1') {
+        if (eden_vma_usage) {
+            unsigned long long vma_blocks = 0, vma_used = 0;
+            eden_vma_usage(&vma_blocks, &vma_used);
+            std::fprintf(stderr, "EDEN_VMA_USAGE blocks %llu MiB, %llu MiB of it in use\n", vma_blocks >> 20, vma_used >> 20);
+        }
+#ifdef EDEN_PS5_RADV
+        eden_radv_private_radv_ps5_memory_report_now();
+#endif
+    }
 }
 #endif
 
