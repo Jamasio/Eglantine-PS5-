@@ -556,6 +556,35 @@ inline void Mark(Totals& totals, long long& since) {
     totals.calls.fetch_add(1, std::memory_order_relaxed);
 }
 
+// EDEN_PERF_REPORT=1 (env.txt, read in main.cpp): the 5 s report says where a frame goes in a
+// normal build, without a development profile: wall time in guest code per guest thread
+// (EDEN_GUEST_RUN), time each guest core sat idle (EDEN_PERF_IDLE), the Vulkan API timers below
+// as one line of differences (EDEN_PERF_COST) and the CPU time of the thread that presents
+// (EDEN_PERF_THREAD). Off, a JIT run pays one relaxed load and nothing else changes.
+inline std::atomic<bool> perf_report{false};
+// The JIT wrapper's Run() (headless/CMakeLists.txt). The name is not Timer on purpose:
+// tools/check-performance.py keeps that one out of the JIT wrappers.
+class GuestRunScope {
+public:
+    explicit GuestRunScope(unsigned long long tid) noexcept
+        : slot(tid < mkw_guest_run.size() ? tid : mkw_guest_run.size() - 1),
+          start(perf_report.load(std::memory_order_relaxed) ? NowNs() : 0) {}
+    GuestRunScope(const GuestRunScope&) = delete;
+    GuestRunScope& operator=(const GuestRunScope&) = delete;
+    ~GuestRunScope() {
+        if (start == 0) return;
+        auto& totals = mkw_guest_run[slot];
+        totals.nanoseconds.fetch_add(static_cast<unsigned long long>(NowNs() - start), std::memory_order_relaxed);
+        totals.calls.fetch_add(1, std::memory_order_relaxed);
+    }
+private:
+    std::size_t slot;
+    long long start;
+};
+// Prints EDEN_PERF_THREAD for the calling thread: its own CPU clock is the only one this
+// firmware answers (EDEN_PERF_OWNER_CLOCK_CHECK; another thread's is not valid).
+void ReportOwnThread(const char* name);
+
 // Opt-in API wall times: calls may overlap across threads, so do not sum them as frame time.
 inline std::atomic<bool> vulkan_cost_enabled{false};
 inline std::array<Totals, 24> vulkan_api;
@@ -575,6 +604,22 @@ inline void ReportVulkan() {
                                   "shader_pool_reset", "shader_cfg", "shader_ir",
                                   "shader_spirv", "shader_module"};
     static_assert(std::size(names) == vulkan_api.size());
+    if (perf_report.load(std::memory_order_relaxed)) {
+        // One line of what changed since the last report, name=milliseconds/calls: a crash keeps
+        // the whole heap.log, and 24 lines every 5 s would be most of it.
+        static std::array<unsigned long long, std::size(names)> last_ns{}, last_calls{};
+        std::printf("EDEN_PERF_COST");
+        for (unsigned i = 0; i < vulkan_api.size(); ++i) {
+            const auto ns = vulkan_api[i].nanoseconds.load(std::memory_order_relaxed);
+            const auto calls = vulkan_api[i].calls.load(std::memory_order_relaxed);
+            if (calls != last_calls[i])
+                std::printf(" %s=%llu/%llu", names[i], (ns - last_ns[i]) / 1000000ULL, calls - last_calls[i]);
+            last_ns[i] = ns;
+            last_calls[i] = calls;
+        }
+        std::printf("\n");
+        return;
+    }
     for (unsigned i = 0; i < vulkan_api.size(); ++i)
         std::printf("EDEN_VULKAN_COST api=%s calls=%llu ns=%llu\n", names[i],
                     vulkan_api[i].calls.load(std::memory_order_relaxed),
@@ -606,6 +651,18 @@ inline void ReportGuestRun() {
     for (size_t i = 0; i < count && i < 12; ++i)
         std::printf(" %u=%llu/%llu", rows[i].tid, rows[i].ns / 1000000ULL, rows[i].calls);
     std::printf("\n");
+    if (perf_report.load(std::memory_order_relaxed)) {
+        // Milliseconds each guest core waited for an interrupt since the last report. What is
+        // left of the report's length ran guest code, the emulated kernel or the JIT compiler.
+        static std::array<unsigned long long, 6> last_idle_ns{};
+        std::printf("EDEN_PERF_IDLE");
+        for (std::size_t core = 0; core < guest_idle.size(); ++core) {
+            const auto ns = guest_idle[core].nanoseconds.load(std::memory_order_relaxed);
+            std::printf(" c%zu=%llu", core, (ns - last_idle_ns[core]) / 1000000ULL);
+            last_idle_ns[core] = ns;
+        }
+        std::printf("\n");
+    }
     // Per guest core since the last report: idles, of them sleeps, average and worst wake-up
     // latency of the sleeps an interrupt ended (microseconds).
     static std::array<IdleCounters, 6> last_idle{};

@@ -701,6 +701,7 @@ void GraphicsWindow::OnFrameDisplayed() {
 #endif
                 Eden::Performance::ReportVulkan();
                 Eden::Performance::ReportGuestRun();
+                Eden::Performance::ReportOwnThread("present");
 #ifdef EDEN_DEV_PROFILE
                 // Composite runs on the GPU thread, so its owner CPU clock is valid here.
                 Eden::Performance::ReportGpuThread(frame_total);

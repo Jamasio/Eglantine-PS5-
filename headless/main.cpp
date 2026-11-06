@@ -540,6 +540,11 @@ int main(int argc, char** argv) {
                                           std::pair{"EDEN_NX2_UNBACKED_LIMIT", "0"}}) {
             setenv(name, value, 0);
         }
+        // Where a frame goes, from a normal build (performance.h, perf_report).
+        if (const char* const report = std::getenv("EDEN_PERF_REPORT"); report && report[0] == '1') {
+            Eden::Performance::perf_report = true;
+            Eden::Performance::vulkan_cost_enabled = true;
+        }
         // The texture collector decides from the pool's shortness as it did (performance.h).
         if (const char* const pool = std::getenv("EDEN_NX2_TC_POOL_PRESSURE"); pool && pool[0] == '1')
             Eden::Performance::texture_usage_from_images = false;

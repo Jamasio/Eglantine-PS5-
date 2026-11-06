@@ -754,6 +754,17 @@ foreach(bits 32 64)
         string(REPLACE "    return TranslateHaltReason(m_jit->Run());"
             "    const auto mkw_tid = thread ? thread->GetThreadId() : 0;\n    ::Eden::Performance::NoteRunning(mkw_tid, ::Eden::Performance::NowNs());\n    ::Eden::Performance::Timer mkw_run_timer(::Eden::Performance::mkw_guest_run[mkw_tid < 512 ? mkw_tid : 511]);\n    const auto mkw_start = ::Eden::Performance::NowNs();\n    const auto mkw_halt = m_jit->Run();\n    ::Eden::Performance::MkwRecordRunExit(mkw_tid, ${mkw_exit_pc}, ::Eden::Performance::NowNs() - mkw_start);\n${mkw_slow_run}    return TranslateHaltReason(mkw_halt);"
             wrapper "${wrapper}")
+    elseif(NOT EDEN_DEV_PROFILE)
+        # EDEN_PERF_REPORT=1 (performance.h, GuestRunScope): one relaxed load per JIT run when off.
+        set(guest_run_old "    return TranslateHaltReason(m_jit->Run());")
+        string(FIND "${wrapper}" "${guest_run_old}" guest_run_at)
+        if(guest_run_at LESS 0)
+            message(FATAL_ERROR "Pinned RunThread changed (${bits})")
+        endif()
+        string(PREPEND wrapper "#include \"${EDEN_PORT_DIR}/performance.h\"\n#include \"core/hle/kernel/k_thread.h\"\n")
+        string(REPLACE "${guest_run_old}"
+            "    ::Eden::Performance::GuestRunScope guest_run_scope(thread ? thread->GetThreadId() : 0);\n${guest_run_old}"
+            wrapper "${wrapper}")
     endif()
     if(EDEN_DEV_PROFILE)
         string(PREPEND wrapper "#include \"${EDEN_PORT_DIR}/performance.h\"\n")

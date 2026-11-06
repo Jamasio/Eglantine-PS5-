@@ -358,6 +358,17 @@ void CheckCpuClocks() {
 }
 }
 
+void ReportOwnThread(const char* name) {
+    if (!perf_report.load(std::memory_order_relaxed) || !owner_cpu_clock_valid) return;
+    static long long last_cpu = 0, last_mono = 0;
+    const long long cpu = ClockNs(CLOCK_THREAD_CPUTIME_ID), mono = ClockNs(CLOCK_MONOTONIC);
+    if (last_mono != 0)
+        std::printf("EDEN_PERF_THREAD name=%s cpu_ms=%lld wall_ms=%lld\n", name, (cpu - last_cpu) / 1000000LL,
+                    (mono - last_mono) / 1000000LL);
+    last_cpu = cpu;
+    last_mono = mono;
+}
+
 void SetSecondaryPlacement(bool enabled) {
 #ifdef PS5_NATIVE
     placement_secondary.store(enabled, std::memory_order_relaxed);
