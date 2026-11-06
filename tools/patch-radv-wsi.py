@@ -206,6 +206,66 @@ radv_ps5_memory_grant_gpu(void *address, uint64_t bytes)
       int64_t physical = -1;
       if (sceKernelAllocateDirectMemory(0, pool, take, grain, RADV_PS5_DIRECT_TYPE, &physical) != 0) {'''),
     ],
+    # EglantinePS5: a compute pipeline whose shader did not compile or upload was still reported
+    # built and still put in the pipeline cache as an object with no shader. Reading that object
+    # faults: the pipeline's own init at shader->info (run56, SIGSEGV at 0x10a), and every later
+    # lookup of the same hash in radv_compute_pipeline_cache_search, where radv_shader_ref(NULL)
+    # touches the reference count at 0x10 (run88, 5 s into the boot replay). The empty object also
+    # reaches the application's vulkan_pipelines.bin and the driver's disk cache, so the fault
+    # comes back at every boot that asks for that pipeline. Three guards: the compile reports the
+    # failure and refuses the pipeline; an empty object is never inserted; an empty object in a
+    # cache blob is refused on deserialization, which makes the runtime drop the entry and take the
+    # fresh compile (vk_pipeline_cache_lookup_object). Each says so on stderr. Nothing changes for a
+    # pipeline with a shader.
+    'src/amd/vulkan/radv_pipeline_compute.c': [
+        ('   cs_stage.feedback.duration += os_time_get_nano() - stage_start;\n'
+         '\n'
+         '   if (!skip_shaders_cache) {\n'
+         '      radv_pipeline_cache_insert(device, cache, &pipeline->base);\n'
+         '   }\n'
+         '\n'
+         '   free(cs_binary);\n'
+         '   if (radv_can_dump_shader_stats(&device->compiler_info, cs_stage.nir)) {\n',
+         '   cs_stage.feedback.duration += os_time_get_nano() - stage_start;\n'
+         '\n'
+         '   if (!pipeline->base.shaders[MESA_SHADER_COMPUTE]) {\n'
+         '      fprintf(stderr, "radv/ps5: compute pipeline %016llx not built: %s; refused, not cached\\n",\n'
+         '              (unsigned long long)pipeline->base.pipeline_hash,\n'
+         '              cs_binary ? "the shader\'s upload failed (shader memory)" : "the compiler gave no binary");\n'
+         '      result = vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);\n'
+         '   } else if (!skip_shaders_cache) {\n'
+         '      radv_pipeline_cache_insert(device, cache, &pipeline->base);\n'
+         '   }\n'
+         '\n'
+         '   free(cs_binary);\n'
+         '   if (pipeline->base.shaders[MESA_SHADER_COMPUTE] &&\n'
+         '       radv_can_dump_shader_stats(&device->compiler_info, cs_stage.nir)) {\n'),
+    ],
+    'src/amd/vulkan/radv_pipeline_cache.c': [
+        ('#include "radv_pipeline_cache.h"\n',
+         '#include "radv_pipeline_cache.h"\n#include <stdio.h>\n'),
+        ('   unsigned num_shaders = blob_read_uint32(blob);\n',
+         '   unsigned num_shaders = blob_read_uint32(blob);\n'
+         '   if (num_shaders == 0) {\n'
+         '      fprintf(stderr, "radv/ps5: a cached pipeline object has no shader (written by an earlier run); "\n'
+         '                      "dropped, the pipeline is compiled again\\n");\n'
+         '      return NULL;\n'
+         '   }\n'),
+        ('   assert(pipeline_obj->num_shaders == 1);\n',
+         '   if (pipeline_obj->num_shaders != 1 || !pipeline_obj->shaders[0]) {\n'
+         '      fprintf(stderr, "radv/ps5: cached compute pipeline %016llx has no shader; compiled again\\n",\n'
+         '              (unsigned long long)pipeline->base.pipeline_hash);\n'
+         '      vk_pipeline_cache_object_unref(&device->vk, &pipeline_obj->base);\n'
+         '      return false;\n'
+         '   }\n'),
+        ('   num_shaders += pipeline->gs_copy_shader ? 1 : 0;\n',
+         '   num_shaders += pipeline->gs_copy_shader ? 1 : 0;\n'
+         '   if (num_shaders == 0) {\n'
+         '      fprintf(stderr, "radv/ps5: pipeline %016llx has no shader, not cached\\n",\n'
+         '              (unsigned long long)pipeline->pipeline_hash);\n'
+         '      return;\n'
+         '   }\n'),
+    ],
     # EglantinePS5: task/mesh draws hung the console's GPU (Mario Kart World, Zelda: Ocarina of Time).
     'src/amd/vulkan/radv_shader.c': [
         # EglantinePS5: spirv_to_nir returns NULL when its builder cannot be allocated or the module
