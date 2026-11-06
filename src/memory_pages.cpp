@@ -381,6 +381,7 @@ void ReleaseServiceBlocks(SparseRange& range) noexcept;
 bool ServiceCommit(SparseRange& range, std::size_t slot) noexcept;
 void ServiceStart(SparseRange& range) noexcept;
 void ServiceStop(SparseRange& range) noexcept;
+bool InCodeCache(std::uintptr_t address) noexcept; // code the JIT made (below, with the code ranges)
 
 void ReleaseSparse(SparseRange& range) {
     if (range.state != nullptr) ReleaseServiceBlocks(range); // its blocks, shared ones once
@@ -931,6 +932,14 @@ struct CodeRange {
 std::array<CodeRange, 16> code_ranges;
 std::mutex code_mutex;
 std::atomic<std::size_t> code_reserved{0}, code_committed{0};
+// Lock-free: asked in a fault handler.
+bool InCodeCache(std::uintptr_t address) noexcept {
+    for (const CodeRange& range : code_ranges) {
+        const std::uintptr_t executable = range.executable.load(std::memory_order_acquire);
+        if (executable != 0 && address >= executable && address - executable < range.span) return true;
+    }
+    return false;
+}
 
 // Memory behind the next step of both ranges. code_mutex is held.
 bool CommitCodeStep(CodeRange& range, std::size_t offset) {

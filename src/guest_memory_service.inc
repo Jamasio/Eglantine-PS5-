@@ -635,7 +635,32 @@ constexpr std::size_t WriterSites = 512;
 WriterSite writer_sites[WriterSites];
 std::atomic<std::uint64_t> promotions_in_app_code{0}, promotions_elsewhere{0};
 thread_local std::uintptr_t fault_pcs[WriterPcs] = {};
-thread_local bool fault_in_app_code = false;
+// What wrote, by where the instruction lies. "Other code" is two things: code the JIT made, the game's
+// own stores, and the system's memcpy and memset (the app imports them), the emulator's copies. A JIT
+// frame's stack is dynarmic's 64 spill slots (1 KiB) that hold what earlier calls left there, so its
+// words name nothing: those writes are one row, of zeroes, and do not fill the table.
+enum : std::uint8_t { WriterUnknown, WriterJit, WriterApp, WriterLibrary, WriterKinds };
+std::atomic<std::uint64_t> promotions_by_kind[WriterKinds];
+thread_local std::uint8_t fault_kind = WriterUnknown;
+
+// The kernel's calls that gave Own slots back by clearing them (ClearGuestMemory), by where they came
+// from: HostMemory::ClearBackingRegion jumps there, so the return address is the kernel's own.
+struct ClearSite {
+    std::atomic<std::uintptr_t> pc{0};
+    std::atomic<std::uint64_t> calls{0}, slots{0};
+};
+constexpr std::size_t ClearSites = 16;
+ClearSite clear_sites[ClearSites];
+void NoteClearSite(std::uintptr_t pc, std::size_t slots) noexcept {
+    for (ClearSite& site : clear_sites) {
+        std::uintptr_t expected = 0;
+        if (site.pc.compare_exchange_strong(expected, pc, std::memory_order_acq_rel) || expected == pc) {
+            site.calls.fetch_add(1, std::memory_order_relaxed);
+            site.slots.fetch_add(slots, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
 
 // The latest promotions, one word each so that a fault handler can write one and a report read it
 // without a lock: the slot, the writer's place in writer_sites (WriterSites: no place left), whether
@@ -653,13 +678,14 @@ std::uint64_t MonotonicMs() noexcept {
 }
 void NoteRecent(std::size_t slot, std::size_t site) noexcept {
     const std::uint64_t word = MonotonicMs() << RecentTimeShift |
-                               std::uint64_t{fault_in_app_code} << (RecentSlotBits + RecentSiteBits) |
+                               std::uint64_t{fault_kind == WriterApp} << (RecentSlotBits + RecentSiteBits) |
                                std::uint64_t{site} << RecentSlotBits | (slot & ((1u << RecentSlotBits) - 1));
     recent_promotions[recent_total.fetch_add(1, std::memory_order_relaxed) % RecentCount].store(word, std::memory_order_relaxed);
 }
 
 void NoteWriter(std::size_t slot) noexcept {
-    (fault_in_app_code ? promotions_in_app_code : promotions_elsewhere).fetch_add(1, std::memory_order_relaxed);
+    (fault_kind == WriterApp ? promotions_in_app_code : promotions_elsewhere).fetch_add(1, std::memory_order_relaxed);
+    promotions_by_kind[fault_kind].fetch_add(1, std::memory_order_relaxed);
     std::uintptr_t key = 0xCBF29CE484222325ull;
     for (const std::uintptr_t pc : fault_pcs) key = (key ^ pc) * 0x100000001B3ull;
     key |= 1;
@@ -881,20 +907,20 @@ struct sigaction service_previous_segv{}, service_previous_bus{};
 
 void ServiceSignal(int signal, siginfo_t* info, void* context) {
 #ifdef PS5_NATIVE
-    fault_in_app_code = false;
+    fault_kind = WriterUnknown;
     for (std::uintptr_t& pc : fault_pcs) pc = 0;
     if (context != nullptr) {
         const auto low = reinterpret_cast<std::uintptr_t>(__eden_text_start) + 8;
         const auto high = reinterpret_cast<std::uintptr_t>(__eden_text_end);
         const std::uintptr_t rip = Eden::Fastmem::ContextRip(context);
-        fault_in_app_code = rip >= low && rip < high;
+        fault_kind = rip >= low && rip < high ? WriterApp : InCodeCache(rip) ? WriterJit : WriterLibrary;
         const auto* stack = reinterpret_cast<const std::uintptr_t*>(Eden::Fastmem::ContextRsp(context));
         std::size_t found = 0;
         // Never past the page (16 KiB) that holds the stack pointer: a thread's stack can end a few
         // hundred bytes above it, and what lies after it is not mapped.
         const auto page_end = ((reinterpret_cast<std::uintptr_t>(stack) | 0x3FFFu) + 1);
         const auto room = static_cast<unsigned>((page_end - reinterpret_cast<std::uintptr_t>(stack)) / sizeof(std::uintptr_t));
-        for (unsigned i = 0; i < 160 && i < room && found < WriterPcs; ++i) {
+        for (unsigned i = 0; fault_kind != WriterJit && i < 160 && i < room && found < WriterPcs; ++i) {
             if (stack[i] >= low && stack[i] < high && (found == 0 || fault_pcs[found - 1] != stack[i])) {
                 fault_pcs[found++] = stack[i];
             }
@@ -1248,13 +1274,42 @@ bool ScanZero(SparseRange& range, std::size_t slot) noexcept {
     return zero;
 }
 
+// Own slots by the 16 KiB pages of zeroes they hold, for the report (EDEN_CRAM_ZEROS): place 0 none,
+// then 1, 2-3, 4-7 ... 64-127. What a lower FineMinZeroPages could give back, and what the slots that
+// wait out a backoff hold. Written by the scanner only; the counts of the last whole pass are kept.
+constexpr std::size_t ZeroPlaces = 8;
+struct ZeroCounts {
+    std::atomic<std::uint32_t> slots[ZeroPlaces]{}, pages[ZeroPlaces]{};
+    std::atomic<std::uint32_t> waiting_slots{0}, waiting_pages{0};
+};
+ZeroCounts zero_counts_now, zero_counts;
+void NoteZeroPages(std::size_t zeros, bool waiting) noexcept {
+    std::size_t place = 0;
+    while (place + 1 < ZeroPlaces && (std::size_t{1} << place) <= zeros) ++place;
+    zero_counts_now.slots[place].fetch_add(1, std::memory_order_relaxed);
+    zero_counts_now.pages[place].fetch_add(static_cast<std::uint32_t>(zeros), std::memory_order_relaxed);
+    if (waiting) {
+        zero_counts_now.waiting_slots.fetch_add(1, std::memory_order_relaxed);
+        zero_counts_now.waiting_pages.fetch_add(static_cast<std::uint32_t>(zeros), std::memory_order_relaxed);
+    }
+}
+void KeepZeroCounts() noexcept {
+    for (std::size_t place = 0; place < ZeroPlaces; ++place) {
+        zero_counts.slots[place].store(zero_counts_now.slots[place].exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
+        zero_counts.pages[place].store(zero_counts_now.pages[place].exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    zero_counts.waiting_slots.store(zero_counts_now.waiting_slots.exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
+    zero_counts.waiting_pages.store(zero_counts_now.waiting_pages.exchange(0, std::memory_order_relaxed), std::memory_order_relaxed);
+}
+
 // An Own slot with many pages of zeroes becomes Fine. A racy count first, then the count again fenced.
 bool ScanFine(SparseRange& range, std::size_t slot) noexcept {
     const std::uintptr_t at = SlotAddress(range, slot);
-    if (counters.passes.load(std::memory_order_relaxed) < range.fine_after[slot]) return false;
     std::size_t zeros = 0;
     for (std::size_t page = 0; page < FinePages; ++page) zeros += PageZero(at + page * FinePage);
-    if (zeros < FineMinZeroPages) return false;
+    const bool waiting = counters.passes.load(std::memory_order_relaxed) < range.fine_after[slot];
+    NoteZeroPages(zeros, waiting);
+    if (waiting || zeros < FineMinZeroPages) return false;
     LockSlot(range, slot);
     if (SlotState(range, slot) != SlotOwn) {
         UnlockSlot(range, slot, SlotState(range, slot));
@@ -1357,6 +1412,7 @@ void ScanPass(SparseRange& range) noexcept {
         }
         i = j;
     }
+    KeepZeroCounts();
     counters.passes.fetch_add(1, std::memory_order_relaxed);
     counters.scan_ns.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
@@ -1426,9 +1482,31 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
     }
     char writers[640];
     int used = std::snprintf(writers, sizeof(writers),
-                             "EDEN_CRAM_WRITERS promotions by code of the app %llu, by other code %llu\n",
-                             (unsigned long long)promotions_in_app_code.load(), (unsigned long long)promotions_elsewhere.load());
+                             "EDEN_CRAM_WRITERS promotions by code of the app %llu, by other code %llu "
+                             "(code the JIT made %llu, system libraries %llu, not known %llu)\n",
+                             (unsigned long long)promotions_in_app_code.load(), (unsigned long long)promotions_elsewhere.load(),
+                             (unsigned long long)promotions_by_kind[WriterJit].load(),
+                             (unsigned long long)promotions_by_kind[WriterLibrary].load(),
+                             (unsigned long long)promotions_by_kind[WriterUnknown].load());
     if (used > 0) Report(writers);
+    used = std::snprintf(writers, sizeof(writers), "EDEN_CRAM_ZEROS Own slots at the last pass by 16 KiB pages of zeroes:");
+    for (std::size_t place = 0; place < ZeroPlaces && used > 0; ++place)
+        used += std::snprintf(writers + used, sizeof(writers) - used, " %zu+=%u slots/%uMiB",
+                              place == 0 ? std::size_t{0} : std::size_t{1} << (place - 1), zero_counts.slots[place].load(),
+                              static_cast<unsigned>(std::uint64_t{zero_counts.pages[place].load()} * FinePage >> 20));
+    if (used > 0)
+        used += std::snprintf(writers + used, sizeof(writers) - used, "; waiting out a backoff %u slots/%uMiB\n",
+                              zero_counts.waiting_slots.load(),
+                              static_cast<unsigned>(std::uint64_t{zero_counts.waiting_pages.load()} * FinePage >> 20));
+    if (used > 0) Report(writers);
+    for (const ClearSite& site : clear_sites) {
+        const std::uintptr_t pc = site.pc.load(std::memory_order_acquire);
+        if (pc == 0) break;
+        if (std::snprintf(writers, sizeof(writers), "EDEN_CRAM_CLEAR_SITE %llu slots in %llu calls: %llx\n",
+                          (unsigned long long)site.slots.load(), (unsigned long long)site.calls.load(),
+                          (unsigned long long)(pc - 0x400000ull)) > 0)
+            Report(writers);
+    }
     for (const Top& entry : top) {
         if (entry.count == 0) break;
         int length = std::snprintf(writers, sizeof(writers), "EDEN_CRAM_WRITER %llu:", (unsigned long long)entry.count);
@@ -1478,12 +1556,14 @@ extern "C" void eden_guest_memory_growth(void) noexcept {
         ++by_range[std::min<std::size_t>((word & ((1u << RecentSlotBits) - 1)) / RangeSlots, Ranges - 1)];
     }
     constexpr std::size_t SlotMiB = SparseSlot >> 20;
-    char line[320];
+    char line[384];
     int length = std::snprintf(line, sizeof(line),
         "EDEN_GUEST_GROWTH held=%zuMiB: slots taken in the last 5 s %zuMiB, 20 s %zuMiB, 60 s %zuMiB (%zuMiB by code of the "
-        "app, %zuMiB by other code); %zu kept, the oldest read %llu ms ago; %llu in the session\n",
+        "app, %zuMiB by other code); %zu kept, the oldest read %llu ms ago; %llu in the session, %llu given back "
+        "(taken is not growth: a slot given back is taken again)\n",
         guest_committed.load(std::memory_order_relaxed) >> 20, last_5s * SlotMiB, last_20s * SlotMiB, last_60s * SlotMiB,
-        by_app * SlotMiB, (last_60s - by_app) * SlotMiB, read, (unsigned long long)oldest_ms, (unsigned long long)total);
+        by_app * SlotMiB, (last_60s - by_app) * SlotMiB, read, (unsigned long long)oldest_ms, (unsigned long long)total,
+        (unsigned long long)(counters.returns_clear.load() + counters.returns_free.load() + counters.returns_scan.load()));
     if (length > 0) Report(line);
     // The largest writers and ranges of that minute.
     for (unsigned pick = 0; pick < 6; ++pick) {
@@ -1829,6 +1909,7 @@ void ClearGuestMemory(std::uint8_t* at, std::uint64_t offset, std::size_t bytes,
         return;
     }
     const std::uint64_t end = offset + bytes;
+    std::size_t returned = 0;
     for (std::uint64_t cursor = offset; cursor < end;) {
         const std::size_t slot = static_cast<std::size_t>(cursor / SparseSlot);
         const std::uint64_t slot_end = (cursor / SparseSlot + 1) * SparseSlot;
@@ -1840,6 +1921,7 @@ void ClearGuestMemory(std::uint8_t* at, std::uint64_t offset, std::size_t bytes,
             if (state != SlotZero) {
                 ReturnSlot(*range, slot);
                 counters.returns_clear.fetch_add(1, std::memory_order_relaxed);
+                ++returned;
             }
             UnlockSlot(*range, slot, SlotZero);
         } else if (SlotState(*range, slot) != SlotZero) {
@@ -1847,6 +1929,7 @@ void ClearGuestMemory(std::uint8_t* at, std::uint64_t offset, std::size_t bytes,
         }
         cursor = piece_end;
     }
+    if (returned != 0) NoteClearSite(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)), returned);
 }
 
 // A page the guest's kernel fills one at a time (optimized allocation): the same rule.

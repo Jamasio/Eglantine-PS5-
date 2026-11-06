@@ -10,6 +10,7 @@ asked for the memory (offsets from the image's start, as in a crash report):
   EDEN_HEAP_SITE <MiB> MiB in <n> blocks: <offsets>   a place that holds heap memory alive
   EDEN_CRAM_WRITER <n>: <offsets>                      a place that wrote guest memory (<n> slots)
   EDEN_GUEST_GROWTH_WRITER <n>MiB: <offsets>           the same in the minute before a refused allocation
+  EDEN_CRAM_CLEAR_SITE <n> slots in <m> calls: <offset> the guest kernel's call that gave Own slots back
 
 The app's code is execute-only on the console, so the app cannot check that an address follows a call.
 That is done here, with the image: addresses whose previous instruction is not a call are stale words of
@@ -104,6 +105,12 @@ def main():
             writers = []
         elif line.startswith('EDEN_CRAM_WRITER '):
             writers.append(line)
+    clears = []
+    for line in log.read_text(errors='replace').splitlines():
+        if line.startswith('EDEN_CRAM_WRITERS'):
+            clears = []
+        elif line.startswith('EDEN_CRAM_CLEAR_SITE '):
+            clears.append(line)
     growth = []
     for line in log.read_text(errors='replace').splitlines():
         if line.startswith('EDEN_GUEST_GROWTH held'):
@@ -132,7 +139,9 @@ def main():
                 continue
             amount, offsets = m.group(1), [int(x, 16) for x in m.group(2).split() if int(x, 16)]
             chain = [n for n in (name(o) for o in offsets) if n]
-            if chain:
+            if not offsets and row.startswith(('EDEN_CRAM_WRITER ', 'EDEN_GUEST_GROWTH_WRITER ')):
+                text = 'code the JIT made, the game\'s own stores (or no app address on the stack)'
+            elif chain:
                 text = ' <- '.join(chain[:3])
             else:
                 # No return address among them: the nearest functions of the words, as a hint only.
@@ -143,6 +152,8 @@ def main():
     show('Guest memory, writers (slots promoted):', writers, r'EDEN_CRAM_WRITER (\d+): (.*)')
     show('Guest memory, the minute before the last refusal:', growth,
          r'EDEN_GUEST_GROWTH_WRITER (\d+MiB): ([0-9a-f ]+)$')
+    show('Guest memory, slots given back by a clear (the kernel call):', clears,
+         r'EDEN_CRAM_CLEAR_SITE (\d+ slots in \d+ calls): (.*)')
 
 
 if __name__ == '__main__':
