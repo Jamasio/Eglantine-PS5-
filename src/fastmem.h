@@ -18,12 +18,6 @@ namespace Eden::Fastmem {
 // is never taken for a fastmem miss. Null until the service runs.
 inline std::atomic<bool (*)(void*) noexcept> guest_write_fault{nullptr};
 
-// Signal stacks (EDEN_SIGNAL_STACK=1, headless/crash_report.h). What every handler of a bad memory
-// access adds to its sigaction flags: SA_ONSTACK | SA_NODEFER with the switch on, 0 without it. The
-// second gives a thread of the guest's memory service its stack: null while off.
-inline std::atomic<int> signal_flags{0};
-inline std::atomic<bool (*)() noexcept> thread_signal_stack{nullptr};
-
 // Select before Core::System (and so HostMemory) is constructed.
 void Request(bool enabled) noexcept;
 bool Requested() noexcept;

@@ -732,9 +732,6 @@ namespace {
 // Writers waiting for a block (WaitForBlock), and how many waits ended with one.
 std::atomic<unsigned> memory_waiters{0};
 std::atomic<std::uint64_t> memory_waits_won{0}, memory_waits_lost{0};
-thread_local std::uintptr_t fault_last = 0;   // HandleGuestWriteFault: the last address,
-thread_local unsigned fault_repeats = 0;      // and how often it faulted in a row
-thread_local unsigned service_depth = 0;      // the handler is running on this thread
 
 // No block was left for a written slot. Most of what the pool gives out is held by the graphics
 // caches, which free what is not drawn once they see memory short (headless/performance.cpp reads
@@ -869,10 +866,12 @@ bool HandleGuestWriteFault(void* fault) noexcept {
     const std::size_t slot = (address - range->begin.load(std::memory_order_relaxed)) / SparseSlot;
     // The same address faulting again and again with nothing to change is not a slot to promote
     // but a real fault. A promotion starts the count again (below).
-    fault_repeats = address == fault_last ? fault_repeats + 1 : 1;
-    fault_last = address;
-    if (fault_repeats > 16) {
-        fault_repeats = 0;
+    static thread_local std::uintptr_t last = 0;
+    static thread_local unsigned repeats = 0;
+    repeats = address == last ? repeats + 1 : 1;
+    last = address;
+    if (repeats > 16) {
+        repeats = 0;
         Refused(address, 1, SlotState(*range, slot));
         Note("EDEN_CRAM refused a write: 17 faults in a row at one address, its slot unchanged\n");
         return false;
@@ -918,24 +917,13 @@ bool HandleGuestWriteFault(void* fault) noexcept {
         // back (cleared, freed or scanned) faults there again and again over a session, each time
         // with something to do: counted as repeats, the 17th such write ended the game after
         // 15 to 60 minutes (Swordpdf/ProsperoEden#246).
-        fault_repeats = 0;
+        repeats = 0;
     }
     return ok;
 }
 
 namespace {
 struct sigaction service_previous_segv{}, service_previous_bus{};
-std::atomic<std::uint64_t> faults_on_signal_stack{0}, faults_on_own_stack{0};
-void NextSignalHandler(int signal, siginfo_t* info, void* context) {
-    const struct sigaction& previous = signal == SIGSEGV ? service_previous_segv : service_previous_bus;
-    if (previous.sa_flags & SA_SIGINFO) {
-        previous.sa_sigaction(signal, info, context);
-    } else if (previous.sa_handler == SIG_DFL) {
-        std::signal(signal, SIG_DFL); // the faulting instruction repeats and ends the process
-    } else if (previous.sa_handler != SIG_IGN) {
-        previous.sa_handler(signal);
-    }
-}
 
 void ServiceSignal(int signal, siginfo_t* info, void* context) {
 #ifdef PS5_NATIVE
@@ -959,36 +947,15 @@ void ServiceSignal(int signal, siginfo_t* info, void* context) {
         }
     }
 #endif
-    if (signal == 0) return; // eden_guest_fault_thread_ready: the thread-locals above exist now
     if (HandleGuestWriteFault(info ? info->si_addr : nullptr)) return;
-    NextSignalHandler(signal, info, context);
-}
-
-// What is installed. With signal stacks on (EDEN_SIGNAL_STACK), a fault that is no slot's goes straight
-// to the next handler: the stack of a thread that overflowed cannot be read above, and a report wants
-// the first fault, not this handler's. So does a fault in this handler: its slot may be locked.
-void GuardedServiceSignal(int signal, siginfo_t* info, void* context) {
-    if (Eden::Fastmem::signal_flags.load(std::memory_order_relaxed) == 0) { // the switch off: as before
-        ServiceSignal(signal, info, context);
-        return;
+    const struct sigaction& previous = signal == SIGSEGV ? service_previous_segv : service_previous_bus;
+    if (previous.sa_flags & SA_SIGINFO) {
+        previous.sa_sigaction(signal, info, context);
+    } else if (previous.sa_handler == SIG_DFL) {
+        std::signal(signal, SIG_DFL); // the faulting instruction repeats and ends the process
+    } else if (previous.sa_handler != SIG_IGN) {
+        previous.sa_handler(signal);
     }
-    const auto address = reinterpret_cast<std::uintptr_t>(info ? info->si_addr : nullptr);
-    const bool ours = service_depth == 0 && (probe_expected.load(std::memory_order_acquire) != 0 || WriteRangeOf(address) != nullptr);
-#ifdef PS5_NATIVE
-    // Whether the kernel took the signal stack: a frame on the thread's own lies just below its rsp.
-    if (context != nullptr) {
-        const auto here = reinterpret_cast<std::uintptr_t>(__builtin_frame_address(0));
-        const bool own = Eden::Fastmem::ContextRsp(context) - here < 65536;
-        (own ? faults_on_own_stack : faults_on_signal_stack).fetch_add(1, std::memory_order_relaxed);
-    }
-#endif
-    if (!ours) {
-        NextSignalHandler(signal, info, context);
-        return;
-    }
-    ++service_depth;
-    ServiceSignal(signal, info, context);
-    --service_depth;
 }
 
 bool InstallServiceSignal() noexcept {
@@ -996,31 +963,13 @@ bool InstallServiceSignal() noexcept {
     static bool installed = false;
     std::call_once(once, [] {
         struct sigaction action{};
-        action.sa_sigaction = GuardedServiceSignal;
-        action.sa_flags = SA_SIGINFO | SA_RESTART | Eden::Fastmem::signal_flags.load(std::memory_order_acquire);
+        action.sa_sigaction = ServiceSignal;
+        action.sa_flags = SA_SIGINFO | SA_RESTART;
         sigemptyset(&action.sa_mask);
         installed = sigaction(SIGSEGV, &action, &service_previous_segv) == 0 &&
                     sigaction(SIGBUS, &action, &service_previous_bus) == 0;
     });
     return installed;
-}
-
-} // namespace
-
-// A thread with a signal stack, outside any handler (headless/performance.cpp RegisterWorker): the
-// handler's thread-locals exist before it needs them. Emulated TLS allocates at the first use, and a
-// signal stack is small.
-extern "C" void eden_guest_fault_thread_ready(void) noexcept {
-    ServiceSignal(0, nullptr, nullptr);
-    fault_last = 0;
-    fault_repeats = 0;
-    service_depth = 0;
-}
-
-namespace {
-void ServiceThreadReady() noexcept {
-    const auto give = Eden::Fastmem::thread_signal_stack.load(std::memory_order_acquire);
-    if (give != nullptr && give()) eden_guest_fault_thread_ready();
 }
 
 // Gives a range slot states (a guest range, or the self-test's).
@@ -1056,7 +1005,6 @@ bool scanner_stop = false;
 std::thread keeper;
 
 void ReserveKeeper() {
-    ServiceThreadReady();
     std::unique_lock lock{scanner_mutex};
     while (!scanner_stop) {
         scanner_wake.wait_for(lock, std::chrono::milliseconds(100), [] { return scanner_stop; });
@@ -1181,7 +1129,6 @@ void SwapTick(SparseRange& range, std::size_t& hand, std::vector<std::pair<std::
 
 std::thread swapper;
 void SwapLoop(SparseRange* range) {
-    ServiceThreadReady();
     std::vector<std::pair<std::int64_t, std::size_t>> cold;
     cold.reserve((range->end - range->begin.load(std::memory_order_relaxed)) / SparseSlot);
     std::size_t hand = 0;
@@ -1602,12 +1549,6 @@ void ServiceReport(SparseRange& range, const char* when) noexcept {
         (unsigned long long)counters.host_reserve_used.load() * (SparseSlot >> 20));
     if (length > 0) Report(line);
     SwapReport(range);
-    if (Eden::Fastmem::signal_flags.load(std::memory_order_relaxed) != 0) {
-        const int stacks = std::snprintf(line, sizeof(line), "EDEN_SIGNAL_STACK faults taken on it=%llu on the thread's own=%llu\n",
-                                         (unsigned long long)faults_on_signal_stack.load(std::memory_order_relaxed),
-                                         (unsigned long long)faults_on_own_stack.load(std::memory_order_relaxed));
-        if (stacks > 0) Report(line);
-    }
     // Where the slots lie, per GiB of the guest's memory: the kernel's pools are apart here (the
     // game's at the top, then the applets', then the system's, whose end nx2:gpu's blocks come from).
     char map[256];
@@ -1779,7 +1720,6 @@ void MeasureFinePages(SparseRange& range) noexcept {
 }
 
 void ScannerLoop(SparseRange* range) {
-    ServiceThreadReady();
     auto next_report = std::chrono::steady_clock::now() + std::chrono::seconds(30);
     std::unique_lock lock{scanner_mutex};
     while (!scanner_stop) {

@@ -13,14 +13,8 @@
 // The report holds addresses, never memory contents. tools/symbolize-crash.py turns them into
 // function names with the build's llvm-pie.elf.
 //
-// Not covered: a crash before Install. Without EDEN_SIGNAL_STACK=1 also a stack overflow (the
-// handler needs the thread's own stack) and a fault inside a fault handler (the signal is masked
-// there): the kernel ends the app with no handler run, which the console shows as CE-108255-1.
-//
-// EDEN_SIGNAL_STACK=1 (env.txt): every thread that names itself gets 32 KiB of its own for signals,
-// under a guard page, in the flexible pool (48 KiB in all a thread; a run has about 50 threads, and
-// fibers share their thread's), and a handler may fault again. Off unless asked for: nothing here
-// has run on the console yet.
+// Not covered: a crash before Install, and a stack overflow (the handler needs the thread's own
+// stack). Those end as before.
 #pragma once
 #include <atomic>
 #include <cstddef>
@@ -72,20 +66,6 @@ Last TakeLast(const std::string& logs_folder, const std::string& eden_log);
 
 // Once, on the main thread, when stderr and stdout go to their log files.
 void Install(const std::string& logs_folder, const char* version, bool restarted);
-
-// After env.txt, on the main thread (env.txt is read after Install): EDEN_SIGNAL_STACK=1 takes
-// effect here. Before a game starts: the handlers installed from now on carry the flags.
-void UseSignalStacks() noexcept;
-// The calling thread's signal stack: true when it has one. Nothing while the switch is off.
-// RegisterWorker calls it (through Fastmem::thread_signal_stack), so a thread that never names
-// itself keeps the old behaviour.
-bool ThreadSignalStack() noexcept;
-// EDEN_CRASH_TEST (env.txt): a crash on purpose, right after UseSignalStacks and before the launcher,
-// to see on a console what each kind ends as:
-//   stack    a fault with the stack pointer in a guard page (a stack overflow)
-//   nested   a fault inside the crash handler
-// With the switch on each writes a report; without it they show what the kernel does instead.
-void RunCrashTest() noexcept;
 
 // What is running, one line for the report. A game the user started also ends the watch for a
 // crash right after a restart (which closes the app instead of starting it over and over).

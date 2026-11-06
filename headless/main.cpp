@@ -78,7 +78,6 @@ extern "C" size_t eden_heap_last_failure(unsigned*, size_t*);
 #include "eglantineps5/version.h"
 extern "C" void ps5_opengl_heap_snapshot(const char*, unsigned);
 extern "C" std::int64_t sceKernelGetDirectMemorySize();
-extern "C" void eden_guest_fault_thread_ready(void) noexcept;  // src/guest_memory_service.inc
 #else
 #include <malloc.h>
 #include "mock_devices.h"
@@ -620,11 +619,6 @@ int main(int argc, char** argv) {
         unsetenv("EDEN_NX2_SHADER_DUMP_MAPPED");
         Eden::BootTrace::Line("MKW diagnostic45: host queue fix plus persistent sparse mapping diagnostics");
 #endif
-        Eden::Crash::UseSignalStacks();  // env.txt EDEN_SIGNAL_STACK=1 (crash_report.h)
-        // This thread names itself nowhere, so RegisterWorker does not do this for it.
-        if (Eden::Fastmem::thread_signal_stack.load(std::memory_order_acquire) != nullptr)
-            eden_guest_fault_thread_ready();
-        Eden::Crash::RunCrashTest();     // env.txt EDEN_CRASH_TEST=stack or nested
         Common::FS::CreateEdenPaths();
         Eden::Performance::PlatformChecks();
         Common::Log::Initialize();
