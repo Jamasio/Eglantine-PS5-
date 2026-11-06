@@ -1,0 +1,336 @@
+memory_manager: keep continuous runs and layout sizes across page table changes elsewhere
+
+Core patch. Paths are the submodule's. Applies on core16 alone.
+
+Source: zortos293/Lichii, GPL-3.0-or-later. The run cache is PR 179 (tibzejoker), head 3ce0ab7106,
+over 7c0b5e791e (already here as patch 0145). The layout cache is the layout part of PR 175 (mja00),
+2aea767bb3.
+
+0145 throws everything away at each page table change, and Lichii saw ~100 changes a second in
+Ocarina. Both caches here keep an answer unless a recorded change touched what it depends on.
+
+EDEN_NX2_RUN_CACHE=1: MaxContinuousRange keeps, per 4 KiB page, where the contiguous run ends.
+=2 also walks, logs differences, uses the walk, and logs hit rates every 10 s.
+EDEN_NX2_BIND_CACHE=1: GetMemoryLayoutSize answers without its mutex. =2 also looks up and logs.
+
+Changed from the sources:
+- BumpMapSerial takes a lock: Lichii's load-then-store loses a bump if two threads map at once.
+- One thread_local object, because a thread_local is a call on the console (emulated TLS).
+- PR 175 caches the whole Binding. That function is what fog-03 changes, so only the layout lookup
+  is cached; what is left there is two table reads. PR 175's 4-way table is replaced by the run cache.
+- BigPageTableOp records whole big pages. Unmap runs it for any range and it clears the big page
+  around a small one, which the recorded range missed. Switch 2 titles map small pages (Nx2Map), so
+  that case is off Ocarina's path, but a run answered "mapped" for memory that was gone.
+
+Runs on the PS5: yes, on the back thread, for native storage buffers.
+Hang: adds no wait. A wrong answer would bind the wrong memory, and a GPU fault can freeze the
+console: run =2 first. Pool memory: 2 KiB per GPU address space always; with a switch on, 160 KiB and
+40 KiB per thread that calls them, allocated at the first call (front and back in practice).
+Checked: the patch's own code on a flat mock page table, 12 million queries through 6,000 random maps,
+0 differences; with the range check removed the same test finds 5,128. That mock has no big pages.
+The real page table code on a two-level table, 16 million queries through 10,800 random operations:
+335 differences with small unmaps inside big pages before the BigPageTableOp change, 0 after.
+PS5-target syntax compile before that change, Mac-target after it. Not run.
+
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index 9b90c1976f..282a2aa63d 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -10,6 +10,7 @@
+ 
+ #include "common/alignment.h"
+ #include "common/assert.h"
++#include "common/cpu_features.h"
+ #include "common/logging.h"
+ #include "common/paged_scalar.h"
+ #include "core/core.h"
+@@ -25,6 +26,10 @@
+ #include "video_core/renderer_base.h"
+ #include "video_core/texture_cache/util.h"
+ 
++#include <atomic>
++#include <cstdlib>
++#include <mutex>
++
+ namespace Tegra {
+ bool MemoryManager::IsShuttingDown() const {
+     return system.IsShuttingDown();
+@@ -169,7 +174,7 @@ GPUVAddr MemoryManager::PageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr de
+     }
+     flush_modified();
+     kind_map.Map(gpu_addr, gpu_addr + size, kind);
+-    map_serial.fetch_add(1, std::memory_order_release);
++    BumpMapSerial(gpu_addr, size);
+     return gpu_addr;
+ }
+ 
+@@ -225,10 +230,50 @@ GPUVAddr MemoryManager::BigPageTableOp(GPUVAddr gpu_addr, [[maybe_unused]] DAddr
+         std::unique_lock<std::mutex> lock(guard);
+         kind_map.Map(gpu_addr, gpu_addr + size, kind);
+     }
+-    map_serial.fetch_add(1, std::memory_order_release);
++    // The loop writes whole big pages, also for an Unmap smaller than one: record all of them, or
++    // a cached run elsewhere in a big page that went away would survive the change.
++    const GPUVAddr changed_begin = gpu_addr & ~big_page_mask;
++    BumpMapSerial(changed_begin,
++                  ((gpu_addr + size + big_page_mask) & ~big_page_mask) - changed_begin);
+     return gpu_addr;
+ }
+ 
++void MemoryManager::BumpMapSerial(GPUVAddr begin, size_t size) {
++    // Serialised: the page table ops can run on different threads, and a lost bump would be a
++    // change no cached answer hears about. Lichii's version has no lock.
++    std::scoped_lock lock{map_change_lock};
++    const u64 next = map_serial.load(std::memory_order_relaxed) + 1;
++    MapChange& change = map_changes[next % MapChangeCount];
++    change.serial.store(0, std::memory_order_relaxed);
++    std::atomic_thread_fence(std::memory_order_release);
++    change.begin.store(begin, std::memory_order_relaxed);
++    change.end.store(begin + size, std::memory_order_relaxed);
++    change.serial.store(next, std::memory_order_release);
++    map_serial.store(next, std::memory_order_release);
++}
++
++bool MemoryManager::UnchangedSince(u64 since, u64 now, GPUVAddr begin, GPUVAddr end) const {
++    if (now < since || now - since > MapChangeCount / 2) {
++        return false;
++    }
++    for (u64 serial = since + 1; serial <= now; ++serial) {
++        const MapChange& change = map_changes[serial % MapChangeCount];
++        if (change.serial.load(std::memory_order_acquire) != serial) {
++            return false;
++        }
++        const GPUVAddr change_begin = change.begin.load(std::memory_order_relaxed);
++        const GPUVAddr change_end = change.end.load(std::memory_order_relaxed);
++        std::atomic_thread_fence(std::memory_order_acquire);
++        if (change.serial.load(std::memory_order_relaxed) != serial) {
++            return false;
++        }
++        if (change_begin < end && begin < change_end) {
++            return false;
++        }
++    }
++    return true;
++}
++
+ void MemoryManager::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_) {
+     rasterizer = rasterizer_;
+ }
+@@ -606,22 +651,107 @@ size_t MemoryManager::MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const {
+     // Native storage buffers ask this for up to 8 MiB on each bind, ~70,000 times a second in
+     // title 1's forest (17% of the GPU thread walking pages): keep answers per thread until the
+     // page table changes.
+-    struct Entry {
++    // From Lichii PR 179 (zortos293/Lichii, head 3ce0ab7106): EDEN_NX2_RUN_CACHE=1 keeps, per 4 KiB
++    // page, where the contiguous run through it ends, and keeps it across page table changes
++    // elsewhere (Lichii saw misses go from ~9,000 to ~500 a second). =2 also walks every time,
++    // logs differences and uses the walk. A function-local static: env.txt is read in main.
++    static const int mode = [] {
++        const char* value = std::getenv("EDEN_NX2_RUN_CACHE");
++        return value == nullptr ? 0 : value[0] - '0';
++    }();
++    const u64 serial = map_serial.load(std::memory_order_acquire);
++    if (mode <= 0) {
++        struct Entry {
++            size_t owner;
++            GPUVAddr gpu_addr;
++            size_t size;
++            u64 serial;
++            size_t result;
++        };
++        thread_local std::array<Entry, 64> cache{};
++        Entry& entry = cache[((gpu_addr ^ size) * 0x9E3779B97F4A7C15ULL) >> 58];
++        if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr &&
++            entry.size == size && entry.serial == serial) {
++            return entry.result;
++        }
++        const size_t result = MaxContinuousRangeUncached(gpu_addr, size);
++        entry = {unique_identifier + 1, gpu_addr, size, serial, result};
++        return result;
++    }
++    // The run from the page start is walked only as far as asked so far: a miss costs about what
++    // a walk from the address does.
++    struct Run {
+         size_t owner;
+-        GPUVAddr gpu_addr;
+-        size_t size;
++        GPUVAddr page;
+         u64 serial;
+-        size_t result;
++        GPUVAddr end;
++        bool broken; ///< The run ends at end; otherwise it was only walked that far
+     };
+-    thread_local std::array<Entry, 64> cache{};
+-    const u64 serial = map_serial.load(std::memory_order_acquire);
+-    Entry& entry = cache[((gpu_addr ^ size) * 0x9E3779B97F4A7C15ULL) >> 58];
+-    if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr && entry.size == size &&
+-        entry.serial == serial) {
+-        return entry.result;
++    // One object: on the console a thread_local is a call (emulated TLS). 160 KiB per thread that
++    // gets here, allocated at its first call: the back thread, in practice.
++    struct RunCache {
++        std::array<Run, 4096> runs;
++        u64 hits, misses, extends, fallbacks, last_report_ns, last_serial;
++    };
++    thread_local RunCache cache{};
++    // Small pages: Ocarina maps separate allocations into one 64 KiB page, so a run from the big
++    // page's start often ends before the address.
++    const GPUVAddr page = gpu_addr & ~page_mask;
++    const GPUVAddr limit = gpu_addr + size;
++    Run& run = cache.runs[(page >> page_bits) % cache.runs.size()];
++    const auto walk = [&] {
++        const size_t length = MaxContinuousRangeUncached(page, limit - page);
++        run = {unique_identifier + 1, page, serial, page + length, page + length < limit};
++    };
++    if (run.owner == unique_identifier + 1 && run.page == page && run.serial != serial &&
++        UnchangedSince(run.serial, serial, page,
++                       (std::max)(run.end, limit) + (GPUVAddr{1} << big_page_bits))) {
++        run.serial = serial;
++    }
++    if (run.owner != unique_identifier + 1 || run.page != page || run.serial != serial) {
++        ++cache.misses;
++        walk();
++    } else if (!run.broken && run.end < limit) {
++        ++cache.extends;
++        walk();
++    } else {
++        ++cache.hits;
++    }
++    size_t result;
++    if (run.end > gpu_addr) {
++        // The run from the page start passes gpu_addr, so the run from gpu_addr ends there too.
++        result = (std::min<size_t>)(size, run.end - gpu_addr);
++    } else {
++        ++cache.fallbacks;
++        result = MaxContinuousRangeUncached(gpu_addr, size);
++    }
++    if (mode >= 2) [[unlikely]] {
++        const size_t expected = MaxContinuousRangeUncached(gpu_addr, size);
++        static std::atomic<u32> logged{};
++        if (expected != result && logged.fetch_add(1, std::memory_order_relaxed) < 64) {
++            LOG_ERROR(HW_GPU, "MaxContinuousRange({:#x}, {:#x}): run cache {:#x}, walk {:#x}",
++                      gpu_addr, size, result, expected);
++        }
++        const u64 now = static_cast<u64>(Common::g_wall_clock.GetTimeNS().count());
++        if (cache.last_report_ns == 0) {
++            cache.last_report_ns = now;
++            cache.last_serial = serial;
++        } else if (now - cache.last_report_ns >= 10'000'000'000ULL) {
++            const double seconds = static_cast<double>(now - cache.last_report_ns) / 1e9;
++            LOG_INFO(HW_GPU,
++                     "MaxContinuousRange per second: hits {:.0f}, misses {:.0f}, extends {:.0f}, "
++                     "fallbacks {:.0f}, page table changes {:.0f}",
++                     static_cast<double>(cache.hits) / seconds,
++                     static_cast<double>(cache.misses) / seconds,
++                     static_cast<double>(cache.extends) / seconds,
++                     static_cast<double>(cache.fallbacks) / seconds,
++                     static_cast<double>(serial - cache.last_serial) / seconds);
++            cache.hits = cache.misses = cache.extends = cache.fallbacks = 0;
++            cache.last_report_ns = now;
++            cache.last_serial = serial;
++        }
++        return expected;
+     }
+-    const size_t result = MaxContinuousRangeUncached(gpu_addr, size);
+-    entry = {unique_identifier + 1, gpu_addr, size, serial, result};
+     return result;
+ }
+ 
+@@ -666,6 +796,49 @@ size_t MemoryManager::MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size)
+ }
+ 
+ size_t MemoryManager::GetMemoryLayoutSize(GPUVAddr gpu_addr, size_t max_size) const {
++    // The layout part of Lichii PR 175 (zortos293/Lichii, 2aea767bb3): every draw rebinds each
++    // storage buffer through this lookup and its mutex. EDEN_NX2_BIND_CACHE=1 keeps the answers
++    // per thread, across page table changes elsewhere (as the run cache of PR 179 does); =2 also
++    // looks each one up, logs differences and uses that. The PR caches the whole binding; that
++    // code is what fog-03 changes, and what is left of it is the two table reads of
++    // GpuToCpuAddress. 40 KiB per thread that gets here, allocated at its first call.
++    static const int mode = [] {
++        const char* value = std::getenv("EDEN_NX2_BIND_CACHE");
++        return value == nullptr ? 0 : value[0] - '0';
++    }();
++    if (mode > 0) {
++        struct Entry {
++            size_t owner;
++            GPUVAddr gpu_addr;
++            u64 serial;
++            size_t result;
++        };
++        thread_local std::array<Entry, 1024> layouts{};
++        const u64 serial = map_serial.load(std::memory_order_acquire);
++        Entry& entry = layouts[(gpu_addr * 0x9E3779B97F4A7C15ULL) >> 54];
++        if (entry.owner == unique_identifier + 1 && entry.gpu_addr == gpu_addr &&
++            (entry.serial == serial ||
++             UnchangedSince(entry.serial, serial, gpu_addr & ~big_page_mask,
++                            gpu_addr + entry.result + big_page_size))) {
++            entry.serial = serial;
++            if (mode >= 2) [[unlikely]] {
++                std::unique_lock<std::mutex> lock(guard);
++                const size_t expected = kind_map.GetContinuousSizeFrom(gpu_addr);
++                static std::atomic<u32> logged{};
++                if (expected != entry.result &&
++                    logged.fetch_add(1, std::memory_order_relaxed) < 64) {
++                    LOG_ERROR(HW_GPU, "GetMemoryLayoutSize({:#x}): cached {:#x}, looked up {:#x}",
++                              gpu_addr, entry.result, expected);
++                }
++                return expected;
++            }
++            return entry.result;
++        }
++        std::unique_lock<std::mutex> lock(guard);
++        const size_t result = kind_map.GetContinuousSizeFrom(gpu_addr);
++        entry = {unique_identifier + 1, gpu_addr, serial, result};
++        return result;
++    }
+     std::unique_lock<std::mutex> lock(guard);
+     return kind_map.GetContinuousSizeFrom(gpu_addr);
+ }
+diff --git a/src/video_core/memory_manager.h b/src/video_core/memory_manager.h
+index 1bc93c1ee2..b93a34bc61 100644
+--- a/src/video_core/memory_manager.h
++++ b/src/video_core/memory_manager.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <array>
+ #include <atomic>
+ #include <map>
+ #include <mutex>
+@@ -158,6 +159,16 @@ public:
+ 
+     size_t MaxContinuousRange(GPUVAddr gpu_addr, size_t size) const;
+ 
++    /// Bumped after each page table change: lookups cached under one value stay valid until then.
++    [[nodiscard]] u64 MapSerial() const {
++        return map_serial.load(std::memory_order_acquire);
++    }
++    /// Whether no page table change after `since` up to `now` touched [begin, end).
++    [[nodiscard]] bool UnchangedSince(u64 since, u64 now, GPUVAddr begin, GPUVAddr end) const;
++    [[nodiscard]] u64 BigPageSize() const {
++        return big_page_size;
++    }
++
+     bool IsWithinGPUAddressRange(GPUVAddr gpu_addr) const {
+         return gpu_addr < address_space_size;
+     }
+@@ -254,6 +265,18 @@ private:
+     /// Bumped after each page table change; MaxContinuousRange answers are kept until then.
+     std::atomic<u64> map_serial{};
+ 
++    /// The ranges of the last page table changes, by serial: a cached answer survives changes
++    /// elsewhere (Lichii: Ocarina changes the page table ~100 times a second).
++    struct MapChange {
++        std::atomic<u64> serial{};
++        std::atomic<GPUVAddr> begin{};
++        std::atomic<GPUVAddr> end{};
++    };
++    static constexpr size_t MapChangeCount = 64;
++    std::array<MapChange, MapChangeCount> map_changes{};
++    std::mutex map_change_lock;
++    void BumpMapSerial(GPUVAddr begin, size_t size);
++
+     static constexpr size_t continuous_bits = 64;
+ 
+     const size_t unique_identifier;

@@ -1,0 +1,755 @@
+puller, maxwell_3d: met semaphores and macro DMA reads without a full drain (off by default)
+
+Core patch. Paths are the submodule's. Needs 0210 and 0214 before it.
+
+Source: zortos293/Lichii PR 179 (tibzejoker), head 3ce0ab7106, GPL-3.0-or-later; the wait for queued
+writers comes from PR 161 (999sian), 64bb6fe0d7. Frysix traced the stale words behind 9d17457f6c.
+
+EDEN_NX2_SEM_FAST: every acquire drains the back today, and a suspended channel sends a ring entry
+per poll.
+  =1 a met acquire waits only for queued engines and writes to that word; polls skip the flush on
+     pages the GPU never wrote; SEM_EXECUTE no longer drains (only a warning read the result).
+  =2 also reads through queued releases the front knows.
+  =3 check only: works out the fast answer, logs a fast "met" the drained read denies. It does not
+     try the SEM_EXECUTE change: that first runs under =1 or =2.
+EDEN_NX2_DMA_WAIT_WRITERS: the same for macro DMA reads. =3 waits, =5 overlays, =4 and =6 compare
+with the drained read, log, and use the drained read.
+
+Changed from the PR, stricter:
+- Queued compute, copy, inline-to-memory and 2D work runs first, so the page bits are current.
+- Counter report pages go in a list of their own, not the written-page bits: here those bits send
+  the guest's reads through the GPU thread (memory.cpp), and it reads report pages.
+- Reads across a mapping break drain. Block-linear uploads count as writes to anywhere.
+- No fast reads with EDEN_GPU_FENCE set or with macros on the back (EDEN_NX2_SPLIT=1): the front
+  sees no 3D writes then. The flush skip and SEM_EXECUTE change still follow EDEN_NX2_SEM_FAST.
+Changed from the PR, looser, on purpose:
+- 9d17457f6c sends timed releases to the drained path too. Here they wait by ring position, because
+  below High accuracy CounterReport writes a payload at once (query_cache.h). From reading only;
+  =3 and =6 test it.
+Still unseen: a draw's first shader store to a page.
+
+Warning from the console: narrower waits gave no frames on Mario Kart's title and one crashed it
+(docs/MKW-TITLE-FPS.md). On a Ryzen 5700G the waits moved rather than vanished, and =6 found 6
+differences a run before 9d17457f6c.
+
+Runs on the PS5: yes. Pool memory: 512 KiB with a switch on, plus a small page list.
+Hang: every new wait is shorter than the drain it replaces, so none adds a block. A stale read can:
+wrong draw arguments can lose the device and freeze the console. Run =3 and =6 first.
+Checked: the wait and overlay code against an in-order model, front and back threads, 2 x 6 million
+writes, and under ThreadSanitizer; breaking the wait makes that test fail (the overlay has no such
+control). PS5-target syntax compile before the review changes, Mac-target after them. Not run.
+
+diff --git a/src/video_core/dma_pusher.cpp b/src/video_core/dma_pusher.cpp
+index a74da1ed4d..fc27350fe5 100644
+--- a/src/video_core/dma_pusher.cpp
++++ b/src/video_core/dma_pusher.cpp
+@@ -505,9 +505,13 @@ void DmaPusher::CallMethod(u32 argument) {
+         const auto engine_type = subchannel_type[dma_state.subchannel];
+         const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
+                             engine_type == Engines::EngineTypes::MaxwellDMA;
++        const bool engine_writer = engine_type == Engines::EngineTypes::KeplerMemory ||
++                                   engine_type == Engines::EngineTypes::Fermi2D;
+         SCOPE_EXIT {
+             if (writer) {
+                 split.NoteWriter();
++            } else if (engine_writer) {
++                split.NoteEngineWriter();
+             }
+         };
+         if (split.Active()) {
+@@ -565,9 +569,13 @@ void DmaPusher::CallMultiMethod(const u32* base_start, u32 num_methods) {
+         const auto engine_type = subchannel_type[dma_state.subchannel];
+         const bool writer = engine_type == Engines::EngineTypes::KeplerCompute ||
+                             engine_type == Engines::EngineTypes::MaxwellDMA;
++        const bool engine_writer = engine_type == Engines::EngineTypes::KeplerMemory ||
++                                   engine_type == Engines::EngineTypes::Fermi2D;
+         SCOPE_EXIT {
+             if (writer) {
+                 split.NoteWriter();
++            } else if (engine_writer) {
++                split.NoteEngineWriter();
+             }
+         };
+         if (split.Active()) {
+diff --git a/src/video_core/engines/maxwell_3d.cpp b/src/video_core/engines/maxwell_3d.cpp
+index 4092419a01..9a1fd07859 100644
+--- a/src/video_core/engines/maxwell_3d.cpp
++++ b/src/video_core/engines/maxwell_3d.cpp
+@@ -17,6 +17,7 @@
+ #include "core/core.h"
+ #include "core/core_timing.h"
+ #include "video_core/dirty_flags.h"
++#include "video_core/nx2.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/gpu.h"
+@@ -847,6 +848,12 @@ struct Maxwell3D::FrontState {
+     bool draw_pending{true};
+     bool skip_same{}; ///< SkipSameValueWrites() && FrontSkipSame(), read once
+     bool loop_skip{}; ///< EDEN_NX2_LOOP_SKIP, read once
++    /// The inline upload being sent, when its words land linearly (EDEN_NX2_DMA_WAIT_WRITERS).
++    bool upload_known{};
++    u64 upload_device{};
++    u32 upload_size{};
++    u32 upload_offset{};
++    std::vector<u32> dma_words;
+     /// The back's draw manager is in an instance loop (DrawMode::Instance): draw.end does nothing.
+     bool instance_loop{};
+ };
+@@ -917,6 +924,13 @@ bool FrontSkipSame() {
+     return skip;
+ }
+ 
++// Methods whose execution on the back writes guest memory (inline uploads, reports).
++bool WritesGuestMemory(u32 method) {
++    return method == MAXWELL3D_REG_INDEX(launch_dma) ||
++           method == MAXWELL3D_REG_INDEX(inline_data) ||
++           method == MAXWELL3D_REG_INDEX(report_semaphore.query);
++}
++
+ // EDEN_NX2_LOOP_SKIP=1: the front does not send the instance loop writes the back ignores.
+ // From Lichii PR 178 (zortos293/Lichii, head 95a227b710). Ocarina sent 520,000 draw.end and 390,000
+ // same-value vertex_buffer.count writes a second there; each is a ring entry and a method call on
+@@ -1030,6 +1044,9 @@ void Maxwell3D::FrontWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 met
+     } else {
+         split.Method(this, method, argument, is_last_call, nullptr);
+     }
++    if (split.NotesWrites() && WritesGuestMemory(method)) [[unlikely]] {
++        FrontNoteMemoryWrite(split, fs, method, &value, 1);
++    }
+ }
+ 
+ void Maxwell3D::FrontCallMethod(Core::System& system, VideoCommon::GpuSplit& split, u32 method,
+@@ -1140,6 +1157,9 @@ void Maxwell3D::FrontCallMultiMethod(Core::System& system, VideoCommon::GpuSplit
+         }
+     }
+     split.MultiMethod(this, method, base_start, amount, methods_pending, nullptr);
++    if (split.NotesWrites() && amount != 0 && WritesGuestMemory(method)) [[unlikely]] {
++        FrontNoteMemoryWrite(split, fs, method, base_start, amount);
++    }
+ }
+ 
+ void Maxwell3D::FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split,
+@@ -1202,6 +1222,9 @@ void Maxwell3D::FrontDmaRead(VideoCommon::GpuSplit& split, FrontState& fs, u32 m
+     const u32 ram = fs.regs[0x156];
+     const u32 words = std::min<u32>(count, 0x1000);
+     const size_t read_bytes = size_t{words} * sizeof(u32);
++    if (FrontDmaReadFast(split, fs, source, words, method, ram)) {
++        return;
++    }
+     if (VideoCommon::Nx2Profile::Enabled()) {
+         VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::DmaReadBytes, read_bytes);
+     }
+@@ -1263,6 +1286,152 @@ bool Maxwell3D::FrontSkipsLoopWrite(FrontState& fs, u32 method, u32 value, bool
+     return method != MAXWELL3D_REG_INDEX(draw.end) || fs.instance_loop;
+ }
+ 
++void Maxwell3D::FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& fs, u32 method,
++                                     const u32* words, u32 count) {
++    const auto unknown = [&split] { split.NoteMemoryWrite(0, ~u64{0}); };
++    if (method == MAXWELL3D_REG_INDEX(report_semaphore.query)) {
++        constexpr u32 base = MAXWELL3D_REG_INDEX(report_semaphore);
++        const GPUVAddr address = (GPUVAddr{fs.regs[base]} << 32) | fs.regs[base + 1];
++        Regs::ReportSemaphore query_regs{};
++        query_regs.query.raw = words[count - 1];
++        const auto device = memory_manager.GpuToCpuAddress(address);
++        if (!device) {
++            return; // CounterReport writes nothing at an unmapped address.
++        }
++        // Payload reports are written when the back runs them (CounterReport, fast fences), a
++        // short release as a fence with the known word. Counters land when the host query ends.
++        if (query_regs.query.report != Regs::ReportSemaphore::Report::Payload) {
++            split.NoteLateWrite(*device);
++        } else if (query_regs.query.operation == Regs::ReportSemaphore::Operation::Release &&
++                   query_regs.query.short_query != 0) {
++            const u32 payload = fs.regs[base + 2];
++            split.NoteMemoryWriteData(*device, &payload, 1);
++        } else {
++            split.NoteMemoryWrite(*device, 16);
++        }
++        return;
++    }
++    constexpr u32 base = MAXWELL3D_REG_INDEX(upload);
++    if (method == MAXWELL3D_REG_INDEX(launch_dma)) {
++        const u64 line_length = fs.regs[base];
++        const u64 lines = (std::max)(fs.regs[base + 1], 1U);
++        const u64 pitch = (std::max<u64>)(fs.regs[base + 4], line_length);
++        const GPUVAddr address = (GPUVAddr{fs.regs[base + 2]} << 32) | fs.regs[base + 3];
++        const u64 size = pitch * (lines - 1) + line_length;
++        const auto device = memory_manager.GpuToCpuAddress(address);
++        // LAUNCH_DMA: bit 0 pitch (linear) layout, bits 5:4 completion (2 releases a semaphore).
++        const u32 launch = words[count - 1];
++        const bool linear = (launch & 1) != 0;
++        if (((launch >> 4) & 3) == 2) {
++            unknown();
++        }
++        fs.upload_known = device && linear && lines == 1 && (*device & 3) == 0 &&
++                          memory_manager.GpuToCpuAddress(address + size - 1) == *device + size - 1;
++        fs.upload_device = device.value_or(0);
++        fs.upload_size = static_cast<u32>((std::min<u64>)(size, ~0U));
++        fs.upload_offset = 0;
++        if (!fs.upload_known) {
++            // Block-linear uploads swizzle into more than their lines (engine_upload.cpp).
++            if (!device || !linear || size == 0 || size > (u64{64} << 20)) {
++                return unknown();
++            }
++            split.NoteMemoryWrite(*device, size);
++        }
++        return;
++    }
++    // inline_data words of the current upload.
++    if (!fs.upload_known) {
++        const auto device = memory_manager.GpuToCpuAddress(
++            (GPUVAddr{fs.regs[base + 2]} << 32) | fs.regs[base + 3]);
++        if (!device || (fs.regs[MAXWELL3D_REG_INDEX(launch_dma)] & 1) == 0) {
++            return unknown();
++        }
++        split.NoteMemoryWrite(*device, fs.regs[base] * u64{(std::max)(fs.regs[base + 1], 1U)} +
++                                           u64{fs.regs[base + 4]} * fs.regs[base + 1]);
++        return;
++    }
++    const u32 remaining_bytes =
++        fs.upload_offset < fs.upload_size ? fs.upload_size - fs.upload_offset : 0;
++    const u32 whole = (std::min<u32>)(count, remaining_bytes / 4);
++    split.NoteMemoryWriteData(fs.upload_device + fs.upload_offset, words, whole);
++    if (whole < count && remaining_bytes % 4 != 0) {
++        split.NoteMemoryWrite(fs.upload_device + fs.upload_offset + whole * 4, remaining_bytes % 4);
++    }
++    fs.upload_offset += (std::min<u32>)(count * 4, remaining_bytes);
++}
++
++// EDEN_NX2_DMA_WAIT_WRITERS (gpu_split.h): the read of a macro without a full drain, or false.
++// From Lichii PR 179 (zortos293/Lichii, head 3ce0ab7106). Changed from the PR: only modes 3 to 6; the
++// queued compute, copy, inline-to-memory and 2D work runs first, as PR 161's version does, so the
++// written-page bits are current (the PR reads past them and only looks at inline uploads, reports
++// and semaphores); reads that cross a mapping break drain; the words come from Read<u32>, which
++// knows the syncpoint shim. What is left unseen: a draw's first shader store to a page.
++bool Maxwell3D::FrontDmaReadFast(VideoCommon::GpuSplit& split, FrontState& fs, GPUVAddr source,
++                                 u32 words, u32 method, u32 ram) {
++    const int mode = VideoCommon::DmaWaitWritersMode();
++    const size_t read_bytes = size_t{words} * sizeof(u32);
++    if (mode < 3 || words == 0 || !split.NotesWrites()) {
++        return false;
++    }
++    split.WaitForEngineWriters(VideoCommon::DrainSite::MacroDmaRead);
++    const auto device = memory_manager.GpuToCpuAddress(source);
++    if (!device || memory_manager.MaxContinuousRange(source, read_bytes) < read_bytes ||
++        split.HasLateWrites(*device, read_bytes)) {
++        return false;
++    }
++    for (GPUVAddr page = *device & ~u64{0xfff}; page < *device + read_bytes; page += 0x1000) {
++        if (Tegra::Nx2IsGpuWritten(page)) {
++            return false;
++        }
++    }
++    const auto read_words = [&] {
++        fs.dma_words.resize(words);
++        for (u32 i = 0; i < words; ++i) {
++            fs.dma_words[i] = memory_manager.Read<u32>(source + u64{i} * sizeof(u32));
++        }
++    };
++    bool known = false;
++    if (mode >= 5) {
++        const u64 since = split.ConsumedNow();
++        read_words();
++        known = split.OverlayQueuedWrites(since, *device, fs.dma_words.data(), words);
++    }
++    if (!known) {
++        if (!split.WaitForWritesTo(*device, read_bytes, VideoCommon::DrainSite::MacroDmaRead)) {
++            return false;
++        }
++        read_words();
++    }
++    if (mode == 4 || mode == 6) {
++        static u64 checks{};
++        static u64 differences{};
++        const std::vector<u32> fast = fs.dma_words;
++        split.Defer([memory = &memory_manager, source, read_bytes] {
++            if (memory->IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
++                memory->FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
++            }
++        });
++        split.Drain(VideoCommon::DrainSite::MacroDmaRead);
++        read_words();
++        ++checks;
++        if (fast != fs.dma_words && differences++ < 16) {
++            LOG_WARNING(HW_GPU, "DMA read check: {} words at {:#x} differ from the drained read",
++                        words, source);
++        }
++        if ((checks & 0xffff) == 0) {
++            LOG_INFO(HW_GPU, "DMA read check: {} reads, {} differed", checks, differences);
++        }
++    }
++    for (u32 i = 0; i < words; ++i) {
++        if (method == 0x158) {
++            fs.parameters.push_back(fs.dma_words[i]);
++        } else if (ram + i < native_data_ram.size()) {
++            native_data_ram[ram + i] = fs.dma_words[i];
++        }
++    }
++    return true;
++}
++
+ void Maxwell3D::FrontVerify(VideoCommon::GpuSplit& split, FrontState& fs) {
+     split.Drain(VideoCommon::DrainSite::FrontVerify);
+     static u64 checks{};
+diff --git a/src/video_core/engines/maxwell_3d.h b/src/video_core/engines/maxwell_3d.h
+index 1dc47209dc..a34f28de20 100644
+--- a/src/video_core/engines/maxwell_3d.h
++++ b/src/video_core/engines/maxwell_3d.h
+@@ -3388,6 +3388,10 @@ private:
+     FrontState& Front(Core::System& system, VideoCommon::GpuSplit& split);
+     void FrontTrackInstanceLoop(FrontState& state, u32 method, u32 value);
+     bool FrontSkipsLoopWrite(FrontState& state, u32 method, u32 value, bool shadow_kept);
++    void FrontNoteMemoryWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method,
++                              const u32* words, u32 count);
++    bool FrontDmaReadFast(VideoCommon::GpuSplit& split, FrontState& state, GPUVAddr source,
++                          u32 words, u32 method, u32 ram);
+     void FrontWrite(VideoCommon::GpuSplit& split, FrontState& state, u32 method, u32 argument,
+                     bool is_last_call, bool from_macro);
+     void FrontRunMacro(Core::System& system, VideoCommon::GpuSplit& split, FrontState& state);
+diff --git a/src/video_core/engines/puller.cpp b/src/video_core/engines/puller.cpp
+index e3064021a2..41b13ed798 100644
+--- a/src/video_core/engines/puller.cpp
++++ b/src/video_core/engines/puller.cpp
+@@ -63,6 +63,16 @@ void ReleaseFencesOnBack(VideoCore::RasterizerInterface* rasterizer) {
+ // the callers needed anyway, so this adds no round trip.
+ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
+     if (const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address)) {
++        // EDEN_NX2_SEM_FAST: a page the GPU never wrote holds nothing to flush, and the flush
++        // costs a ring entry and a wake of the back on every poll of a suspended channel. The
++        // bit is read after the drain: a queued dispatch can be the first to write the page.
++        // Not with =3: this read is what that mode checks the fast answer against.
++        if (const int fast = VideoCommon::SemFastMode(); fast == 1 || fast == 2) {
++            DrainBack();
++            if (!Nx2IsGpuWritten(*device)) {
++                return dma_pusher.memory_manager.Read<u32>(address);
++            }
++        }
+         OnBack([rasterizer = dma_pusher.rasterizer, device = *device] {
+             if (rasterizer->MustFlushRegion(device, sizeof(u32), VideoCommon::CacheType::BufferCache)) {
+                 rasterizer->FlushRegion(device, sizeof(u32), VideoCommon::CacheType::BufferCache);
+@@ -75,6 +85,80 @@ u32 ReadSemaphoreWord(DmaPusher& dma_pusher, GPUVAddr address) {
+ 
+ } // Anonymous namespace
+ 
++// EDEN_NX2_SEM_FAST (gpu_split.h): whether the acquire about to run is met without a full drain.
++// From Lichii PR 179 (zortos293/Lichii, head 3ce0ab7106, there "not verified yet"); the first wait is
++// from PR 161 (64bb6fe0d7). Changed from PR 179: the queued compute, copy, inline-to-memory and 2D
++// work runs first, so the written-page bits and those engines' own releases are current (PR 179
++// reads past them); =3 checks against the drained read and changes nothing. Only a met acquire
++// skips the drain: a word that does not match goes the usual way, so this cannot turn a wait into
++// a pass unless a write it does not know of would have changed a word that already matches.
++bool Puller::AcquireMetWithoutDrain(DmaPusher& dma_pusher) {
++    const int mode = VideoCommon::SemFastMode();
++    auto& split = VideoCommon::GpuSplit::Get();
++    if (mode == 0 || !g_nx2_ampere || !split.Active() || !split.NotesWrites()) {
++        return false;
++    }
++    const auto op = GpuSemaphoreOperation(regs.semaphore_trigger & 0xF);
++    if (op != GpuSemaphoreOperation::AcquireEqual && op != GpuSemaphoreOperation::AcquireGequal &&
++        op != GpuSemaphoreOperation::AcquireMask) {
++        return false;
++    }
++    const GPUVAddr address = regs.semaphore_address.SemaphoreAddress();
++    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
++    if (!device) {
++        return false;
++    }
++    split.WaitForEngineWriters(VideoCommon::DrainSite::Acquire);
++    if (Nx2IsGpuWritten(*device) || split.HasLateWrites(*device, 4)) {
++        return false;
++    }
++    u32 word{};
++    bool known = false;
++    if (mode >= 2) {
++        const u64 since = split.ConsumedNow();
++        word = dma_pusher.memory_manager.Read<u32>(address);
++        known = split.OverlayQueuedWrites(since, *device, &word, 1);
++    }
++    if (!known) {
++        if (!split.WaitForWritesTo(*device, 16, VideoCommon::DrainSite::Acquire)) {
++            return false;
++        }
++        word = dma_pusher.memory_manager.Read<u32>(address);
++    }
++    const PendingAcquire acquire{
++        .address = address,
++        .value = regs.semaphore_sequence,
++        .operation = static_cast<u32>(op),
++        .since = {},
++        .reported = false,
++    };
++    const bool met = acquire.Matches(word);
++    if (mode == 3) {
++        static u64 checks{};
++        static u64 differences{};
++        static u64 met_later{};
++        const u32 exact = ReadSemaphoreWord(dma_pusher, address);
++        ++checks;
++        // A fast "not met" does no harm: it goes the usual way, and a CPU release during the
++        // drain makes those by itself. Only a fast "met" the drained read denies would.
++        if (!met && acquire.Matches(exact)) {
++            ++met_later;
++        } else if (met && !acquire.Matches(exact) && differences++ < 16) {
++            LOG_WARNING(HW_GPU, "Semaphore fast check: {:#x} op {} value {:#x}: fast {:#x}, drained {:#x}",
++                        address, static_cast<u32>(op), acquire.value, word, exact);
++        }
++        if ((checks & 0xffff) == 0) {
++            LOG_INFO(HW_GPU, "Semaphore fast check: {} acquires, {} differed, {} met during the drain",
++                     checks, differences, met_later);
++        }
++        return false;
++    }
++    if (met) {
++        VideoCommon::Nx2Profile::Add(VideoCommon::Nx2Profile::Counter::AcquireChecks, 1);
++    }
++    return met;
++}
++
+ bool Puller::PendingAcquire::Matches(u32 current) const {
+     switch (static_cast<GpuSemaphoreOperation>(operation)) {
+     case GpuSemaphoreOperation::AcquireEqual:
+@@ -353,6 +437,13 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+         return;
+     }
+     // Acquires: check once after flushing pending fences; never block the GPU thread on them.
++    // Only the warning below reads the result: with EDEN_NX2_SEM_FAST the fences are released in
++    // order and the front goes on (Lichii PR 179).
++    if (const int fast = VideoCommon::SemFastMode();
++        (fast == 1 || fast == 2) && VideoCommon::GpuSplit::Get().Active()) {
++        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); });
++        return;
++    }
+     DrainBack(VideoCommon::DrainSite::SemExecute);
+     ReleaseFencesOnBack(dma_pusher.rasterizer);
+     const u32 word = dma_pusher.memory_manager.Read<u32>(address);
+@@ -371,6 +462,28 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
+     }
+ }
+ 
++namespace {
++
++// A release queued for the split's back. A release of a known word is overlaid by readers; a
++// timed one writes 16 bytes the front does not know, so they wait for it.
++void NoteSemaphoreWrite(DmaPusher& dma_pusher, GPUVAddr address, const u32* payload) {
++    auto& split = VideoCommon::GpuSplit::Get();
++    if (!split.NotesWrites()) {
++        return;
++    }
++    const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
++    if (!device) {
++        return; // Queries write nothing at an unmapped address.
++    }
++    if (payload != nullptr) {
++        split.NoteMemoryWriteData(*device, payload, 1);
++    } else {
++        split.NoteMemoryWrite(*device, 16);
++    }
++}
++
++} // Anonymous namespace
++
+ /// Calls a GPU puller method.
+ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_call) {
+     static const bool nx2_trace = std::getenv("EDEN_NX2_PULLER_TRACE") != nullptr;
+@@ -403,7 +516,19 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
+         OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->WaitForIdle(); });
+         break;
+     case BufferMethods::SemaphoreOperation: {
++        if (AcquireMetWithoutDrain(dma_pusher)) {
++            break;
++        }
+         ProcessSemaphoreTriggerMethod(dma_pusher);
++        if (VideoCommon::GpuSplit::Get().NotesWrites() &&
++            GpuSemaphoreOperation(regs.semaphore_trigger & 0xF) == GpuSemaphoreOperation::WriteLong) {
++            const GPUVAddr address = regs.semaphore_address.SemaphoreAddress();
++            const bool fence = g_nx2_ampere && (regs.semaphore_trigger & (1U << 24)) != 0;
++            NoteSemaphoreWrite(dma_pusher, address, fence ? &regs.semaphore_sequence : nullptr);
++            if (const GPUVAddr mirror = g_nx2_ampere ? Nx2SemaphoreMirror(address) : 0; mirror != 0) {
++                NoteSemaphoreWrite(dma_pusher, mirror, fence ? &regs.semaphore_sequence : nullptr);
++            }
++        }
+         break;
+     }
+     case BufferMethods::NonStallInterrupt: {
+@@ -434,6 +559,12 @@ void Puller::CallPullerMethod(DmaPusher& dma_pusher, const MethodCall& method_ca
+     case BufferMethods::SemaphoreRelease: {
+         if (g_nx2_ampere) {
+             ProcessSemaphoreExecute(dma_pusher, method_call.argument);
++            if ((method_call.argument & 7) == 1) {
++                NoteSemaphoreWrite(dma_pusher,
++                                   (GPUVAddr{regs.reg_array[0x18] & 0x1FFFFFF} << 32) |
++                                       (regs.reg_array[0x17] & ~3U),
++                                   &regs.reg_array[0x19]);
++            }
+         } else {
+             ProcessSemaphoreRelease(dma_pusher);
+         }
+diff --git a/src/video_core/engines/puller.h b/src/video_core/engines/puller.h
+index 2b9e2c5df3..2ae7f46512 100644
+--- a/src/video_core/engines/puller.h
++++ b/src/video_core/engines/puller.h
+@@ -145,6 +145,7 @@ private:
+     void ProcessSemaphoreAcquire(DmaPusher& dma_pusher);
+     void ProcessSemaphoreRelease(DmaPusher& dma_pusher);
+     void ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher);
++    bool AcquireMetWithoutDrain(DmaPusher& dma_pusher);
+     void ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument);
+     [[nodiscard]] bool ExecuteMethodOnEngine(DmaPusher& dma_pusher, u32 method);
+ 
+diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
+index 2f8b755aec..bbc6573353 100644
+--- a/src/video_core/gpu_split.cpp
++++ b/src/video_core/gpu_split.cpp
+@@ -154,6 +154,12 @@ void GpuSplit::MaybeStart(Core::System& system_) {
+     const char* jit = std::getenv("EDEN_NX2_MME_JIT");
+     front_macros = mode == '2' && (jit == nullptr || jit[0] != '0');
+ #endif
++    // Only the front's macro paths see the 3D engine's writes. With delayed fences a release
++    // lands after its fence: no ring position says when.
++    if (front_macros && (SemFastMode() != 0 || DmaWaitWritersMode() != 0) &&
++        Settings::IsGPUFenceBehaviorDefault()) {
++        pending_writes = std::make_unique<PendingWrite[]>(PendingWriteCount);
++    }
+     LOG_INFO(HW_GPU, "GPU thread split: engine methods run on a second thread{}",
+              front_macros ? ", macros on the first" : "");
+ }
+@@ -174,6 +180,10 @@ void GpuSplit::Stop() {
+     ring.reset();
+     write_position = 0;
+     last_writer_position = 0;
++    last_engine_writer_position = 0;
++    pending_writes.reset();
++    pending_write_count = 0;
++    late_pages.clear();
+     published_local = 0;
+     consumed_cache = 0;
+     publish_every = PublishEvery;
+@@ -298,6 +308,74 @@ bool GpuSplit::WaitForWriters() {
+     return WaitFor(std::min(last_writer_position, write_position), DrainSite::ListWriters);
+ }
+ 
++bool GpuSplit::WaitForEngineWriters(DrainSite site) {
++    const u64 target = std::max(last_writer_position, last_engine_writer_position);
++    return WaitFor(std::min(target, write_position), site);
++}
++
++bool GpuSplit::WaitForWritesTo(u64 begin, u64 size, DrainSite site) {
++    consumed_cache = consumed.load(std::memory_order_acquire);
++    const u64 end = begin + size;
++    const u64 remembered = std::min(pending_write_count, PendingWriteCount);
++    u64 target = 0;
++    u64 scanned = 0;
++    for (; scanned < remembered; ++scanned) {
++        const PendingWrite& write =
++            pending_writes[(pending_write_count - 1 - scanned) % PendingWriteCount];
++        if (write.position <= consumed_cache) {
++            break;
++        }
++        if (write.begin < end && begin < write.end) {
++            target = std::max(target, write.position);
++        }
++    }
++    if (scanned == PendingWriteCount) {
++        return false;
++    }
++    if (target != 0) {
++        WaitFor(target, site);
++    }
++    return true;
++}
++
++bool GpuSplit::OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words) {
++    if ((begin & 3) != 0) {
++        return false;
++    }
++    const u64 end = begin + u64{words} * sizeof(u32);
++    const u64 remembered = std::min(pending_write_count, PendingWriteCount);
++    // Newest first, back to what the back had consumed before guest memory was read.
++    std::array<u32, 64> overlapping;
++    u32 found = 0;
++    u64 scanned = 0;
++    for (; scanned < remembered; ++scanned) {
++        const u64 index = (pending_write_count - 1 - scanned) % PendingWriteCount;
++        const PendingWrite& write = pending_writes[index];
++        if (write.position <= since) {
++            break;
++        }
++        if (write.begin < end && begin < write.end) {
++            if (write.words == 0 || (write.begin & 3) != 0 || found == overlapping.size()) {
++                return false;
++            }
++            overlapping[found++] = static_cast<u32>(index);
++        }
++    }
++    if (scanned == PendingWriteCount) {
++        return false;
++    }
++    for (u32 i = found; i-- > 0;) {
++        const PendingWrite& write = pending_writes[overlapping[i]];
++        for (u32 w = 0; w < write.words; ++w) {
++            const u64 address = write.begin + u64{w} * sizeof(u32);
++            if (address >= begin && address < end) {
++                out[(address - begin) / sizeof(u32)] = write.data[w];
++            }
++        }
++    }
++    return true;
++}
++
+ // From Lichii (zortos293/Lichii, nx2 at 27226d2568): one wait with a site for the report. It waits
+ // as WaitForWriters and WaitForSpace did, and now both wake a parked back and report as Drain does.
+ bool GpuSplit::WaitFor(u64 target, DrainSite site) {
+diff --git a/src/video_core/gpu_split.h b/src/video_core/gpu_split.h
+index 27bcccd68f..d5f7191983 100644
+--- a/src/video_core/gpu_split.h
++++ b/src/video_core/gpu_split.h
+@@ -5,8 +5,10 @@
+ 
+ #include <array>
+ #include <atomic>
++#include <cstdlib>
+ #include <cstring>
+ #include <functional>
++#include <unordered_set>
+ #include <memory>
+ #include <thread>
+ #include <type_traits>
+@@ -44,6 +46,29 @@ inline constexpr std::array<const char*, static_cast<size_t>(DrainSite::Count)>
+     "list flush",   "macro dma read", "map",        "front start",   "front verify",
+ };
+ 
++// From Lichii PR 179 (zortos293/Lichii, head 3ce0ab7106), narrower than there: see the note in
++// puller.cpp. Function-local statics: the console's env.txt is read in main, after the globals.
++/// EDEN_NX2_SEM_FAST: 1 a semaphore acquire that is met needs no full drain, 2 also reads through
++/// the queued releases the front knows, 3 works the answer out, compares it with the drained read
++/// and logs, and changes nothing else.
++[[nodiscard]] inline int SemFastMode() {
++    static const int mode = [] {
++        const char* value = std::getenv("EDEN_NX2_SEM_FAST");
++        return value == nullptr ? 0 : value[0] - '0';
++    }();
++    return mode;
++}
++/// EDEN_NX2_DMA_WAIT_WRITERS: 3 a macro's DMA read waits only for the queued work that can write
++/// the words, 5 also reads through the queued writes the front knows; 4 and 6 do that, compare it
++/// with the drained read, log, and use the drained read.
++[[nodiscard]] inline int DmaWaitWritersMode() {
++    static const int mode = [] {
++        const char* value = std::getenv("EDEN_NX2_DMA_WAIT_WRITERS");
++        return value == nullptr ? 0 : value[0] - '0';
++    }();
++    return mode;
++}
++
+ // Splits the GPU thread in two (NX2_GPU_THREAD_SPLIT.md). The GPU thread (the front) takes the
+ // CPU's commands, parses command lists and runs the puller; engine method calls and everything
+ // behind them (register state, macros, draws, the rasterizer and its caches) run in order on a
+@@ -171,6 +196,76 @@ public:
+     /// Waits until the back executed the compute and copy work sent so far (not what came after).
+     /// Returns whether any of it was still queued.
+     bool WaitForWriters();
++    /// Inline-to-memory or 2D work was just sent: it writes guest memory at addresses not noted.
++    void NoteEngineWriter() {
++        last_engine_writer_position = write_position;
++    }
++    /// Waits for the compute, copy, inline-to-memory and 2D work sent so far.
++    bool WaitForEngineWriters(DrainSite site);
++    /// Whether the front notes the queued writes below (EDEN_NX2_SEM_FAST, _DMA_WAIT_WRITERS).
++    [[nodiscard]] bool NotesWrites() const {
++        return pending_writes != nullptr;
++    }
++    /// Work that writes the device range [begin, begin + size) was just sent (an inline upload, a
++    /// report, a semaphore release). size ~0 means an unknown range.
++    void NoteMemoryWrite(u64 begin, u64 size) {
++        if (!NotesWrites()) {
++            return;
++        }
++        PendingWrite& write = pending_writes[pending_write_count++ % PendingWriteCount];
++        write.begin = begin;
++        write.end = size == ~u64{0} ? ~u64{0} : begin + size;
++        write.position = write_position;
++        write.words = 0;
++    }
++    /// As NoteMemoryWrite, for a write whose words the front knows (a fence release payload,
++    /// linear inline upload data): reads overlay them instead of waiting.
++    void NoteMemoryWriteData(u64 begin, const u32* data, u32 words) {
++        if (!NotesWrites()) {
++            return;
++        }
++        while (words != 0) {
++            const u32 count = (words < PendingWriteWords) ? words : PendingWriteWords;
++            PendingWrite& write = pending_writes[pending_write_count++ % PendingWriteCount];
++            write.begin = begin;
++            write.end = begin + u64{count} * sizeof(u32);
++            write.position = write_position;
++            write.words = count;
++            std::memcpy(write.data.data(), data, count * sizeof(u32));
++            begin += u64{count} * sizeof(u32);
++            data += count;
++            words -= count;
++        }
++    }
++    /// A counter report into [begin, begin + 16) was just sent. The query cache writes those when
++    /// the host query completes, not when the back runs them (Lichii PR 179, 9d17457f6c, after
++    /// Frysix traced stale words to them), so no ring position says when they land.
++    void NoteLateWrite(u64 begin) {
++        if (NotesWrites()) {
++            late_pages.insert(begin >> 12);
++            late_pages.insert((begin + 15) >> 12);
++        }
++    }
++    /// Whether a page of [begin, begin + size) ever took a late write: those reads drain.
++    [[nodiscard]] bool HasLateWrites(u64 begin, u64 size) const {
++        for (u64 page = begin >> 12; page <= (begin + size - 1) >> 12; ++page) {
++            if (late_pages.contains(page)) {
++                return true;
++            }
++        }
++        return false;
++    }
++    /// The back's position, for OverlayQueuedWrites: take it before reading guest memory.
++    [[nodiscard]] u64 ConsumedNow() const {
++        return consumed.load(std::memory_order_acquire);
++    }
++    /// Applies to `out` (the words at device address `begin`, read from guest memory after
++    /// `since` = ConsumedNow()) the queued writes the front knows the words of. False when an
++    /// overlapping queued write's words are unknown (the caller waits instead).
++    bool OverlayQueuedWrites(u64 since, u64 begin, u32* out, u32 words);
++    /// Waits until the back executed the noted writes that overlap [begin, begin + size).
++    /// Returns false when more writes are queued than are remembered (the caller drains).
++    bool WaitForWritesTo(u64 begin, u64 size, DrainSite site);
+ 
+ private:
+     enum class Kind : u64 {
+@@ -188,6 +283,15 @@ private:
+     static constexpr size_t RingMask = RingWords - 1;
+     static constexpr u32 MaxMultiWords = 8192;
+     static constexpr size_t PublishEvery = 256;
++    static constexpr u32 PendingWriteWords = 8;
++    static constexpr u64 PendingWriteCount = 8192;
++    struct PendingWrite {
++        u64 begin;
++        u64 end;
++        u64 position;
++        u32 words; ///< Known words from begin, or 0 (unknown contents)
++        std::array<u32, PendingWriteWords> data;
++    };
+ 
+     template <typename Func>
+     static void CallThunk(const u64* payload) {
+@@ -236,6 +340,13 @@ private:
+     // Front side.
+     u64 write_position{};
+     u64 last_writer_position{};
++    u64 last_engine_writer_position{};
++    /// 512 KiB, only with a switch that reads them on.
++    std::unique_ptr<PendingWrite[]> pending_writes;
++    u64 pending_write_count{};
++    /// Not the written-page bits, as in Lichii: those send the guest's reads of a page through
++    /// the GPU thread on the console (memory.cpp), and report pages are read by the guest.
++    std::unordered_set<u64> late_pages;
+     u64 published_local{};
+     u64 consumed_cache{};
+     /// Words between publishes: small right after a drain, while the back has nothing to do.
