@@ -938,13 +938,22 @@ adapt('src/video_core/vulkan_common/vulkan_device.cpp', 'vulkan_device.cpp', [
      '    features.robustness2.robustImageAccess2 = VK_FALSE;\n'
      '    extensions.robustness_2 = features.robustness2.nullDescriptor;',
      '    if (!::Eden::DevVulkan::robustness2) {\n'
-     '        features.robustness2.robustBufferAccess2 = VK_FALSE;\n'
+     '        // EDEN_NX2_ROBUST_BUFFERS=1 (mja00/Lichii 6571c04166): out-of-bounds storage buffer\n'
+     '        // reads return garbage on AMD without it; Ocarina fog compute shader\n'
+     '        // 75d4369f3b1f5868 filled distant froxels with large values and turned the sky white.\n'
+     '        const char* const robust_buffers = std::getenv("EDEN_NX2_ROBUST_BUFFERS");\n'
+     '        if (robust_buffers == nullptr || robust_buffers[0] == \'0\') {\n'
+     '            features.robustness2.robustBufferAccess2 = VK_FALSE;\n'
+     '        }\n'
      '        features.robustness2.robustImageAccess2 = VK_FALSE;\n'
      '    }\n'
      '    if (::Eden::DevVulkan::disable_null_descriptor) {\n'
      '        features.robustness2.nullDescriptor = VK_FALSE;\n'
      '    }\n'
-     '    extensions.robustness_2 = features.robustness2.nullDescriptor;'),
+     '    extensions.robustness_2 = features.robustness2.nullDescriptor;\n'
+     '    LOG_INFO(Render_Vulkan, "robustness2 extension {} robustBufferAccess2 {} nullDescriptor {}",\n'
+     '             extensions.robustness_2, features.robustness2.robustBufferAccess2 != VK_FALSE,\n'
+     '             features.robustness2.nullDescriptor != VK_FALSE);'),
     ('            (queue_family_properties[*graphics].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0;',
      '            (queue_family_properties[*graphics].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT) != 0 &&\n'
      '            !::Eden::DevVulkan::disable_sparse;'),
