@@ -130,6 +130,9 @@ extern "C" bool eden_jit_shared;  // headless/dynarmic/jit_group_support.inc
 #include "stop_limit.h"
 #include "test_harness.h"
 extern "C" bool eden_page_reuse;  // headless/dynarmic/page_reuse_pass.inc
+extern "C" bool eden_free_moves, eden_alloc_r13;  // headless/dynarmic/reg_alloc.cmake
+extern "C" bool eden_plain_ordered_reads;  // headless/CMakeLists.txt
+extern "C" bool eden_fcmp_adc, eden_light_dmb, eden_checkbit_flags;  // headless/dynarmic/fast_paths.cmake
 namespace Common {
 void SetGuestMemoryFine(bool on) noexcept;
 bool SparseTablesAvailable() noexcept; // src/memory_pages.cpp
@@ -571,6 +574,25 @@ int main(int argc, char** argv) {
         // only acts on the direct table, EDEN_JIT_TABLE=1.
         if (const char* const reuse = std::getenv("EDEN_JIT_PAGE_REUSE"); reuse && reuse[0] == '1')
             eden_page_reuse = true;
+        // JIT code generation, read before the first block compiles. EDEN_JIT_CODEGEN=1 turns all
+        // six on; a switch of its own wins, so EDEN_JIT_R13=0 takes one out of the set.
+        {
+            const char* const all = std::getenv("EDEN_JIT_CODEGEN");
+            const auto chosen = [all](const char* name) {
+                const char* const own = std::getenv(name);
+                return own ? own[0] == '1' : all && all[0] == '1';
+            };
+            eden_free_moves = chosen("EDEN_JIT_FREE_MOVES");
+            eden_alloc_r13 = chosen("EDEN_JIT_R13");
+            eden_plain_ordered_reads = chosen("EDEN_JIT_PLAIN_ORDERED");
+            eden_fcmp_adc = chosen("EDEN_JIT_FCMP_ADC");
+            eden_light_dmb = chosen("EDEN_JIT_LIGHT_DMB");
+            eden_checkbit_flags = chosen("EDEN_JIT_CHECKBIT_FLAGS");
+            std::printf("EDEN_JIT_CODEGEN free_moves=%d r13=%d plain_ordered=%d fcmp_adc=%d light_dmb=%d "
+                        "checkbit_flags=%d page_reuse=%d\n", eden_free_moves, eden_alloc_r13,
+                        eden_plain_ordered_reads, eden_fcmp_adc, eden_light_dmb, eden_checkbit_flags,
+                        eden_page_reuse);
+        }
         // Where a frame goes, from a normal build (performance.h, perf_report).
         if (const char* const report = std::getenv("EDEN_PERF_REPORT"); report && report[0] == '1') {
             Eden::Performance::perf_report = true;

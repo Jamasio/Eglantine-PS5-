@@ -11,6 +11,8 @@ set(PORT_BUILD_DIR "${CMAKE_BINARY_DIR}/headless")
 include("${CMAKE_CURRENT_LIST_DIR}/dynarmic/shared-jit.cmake")
 # Register-allocator bookkeeping visits only the host locations in use (compile time).
 include("${CMAKE_CURRENT_LIST_DIR}/dynarmic/reg_alloc.cmake")
+# Shorter x64 code for FCMP, DMB and CBZ/TBZ-style branches (block compile time switches).
+include("${CMAKE_CURRENT_LIST_DIR}/dynarmic/fast_paths.cmake")
 if(PS5_NATIVE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(EDEN_SHARED_JIT ON)
 endif()
@@ -303,6 +305,7 @@ foreach(bits 32 64)
     if(bits EQUAL 64)
         eden_shared_jit_emitter()
     endif()
+    eden_fast_paths_emitter(${bits})
     write_derived("${PORT_BUILD_DIR}/a${bits}_emit_x64.cpp" "${emitter}")
     get_target_property(jit_sources dynarmic SOURCES)
     list(FILTER jit_sources EXCLUDE REGEX "(^|/)a${bits}_emit_x64\\.cpp$")
@@ -331,9 +334,11 @@ if(PS5_NATIVE OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     string(FIND "${port_regalloc_header}" "if (!iter.IsReleased())" port_released_check)
     if(NOT port_released_check LESS 0)
         file(REMOVE "${PORT_BUILD_DIR}/include/dynarmic/backend/x64/reg_alloc.h")
+        eden_reg_alloc_codegen_only()
     else()
         eden_reg_alloc_sources()
     endif()
+    eden_fast_paths_sources()
 endif()
 
 # Patch lookup must not create a large empty record for every compiled block.
@@ -382,6 +387,10 @@ string(REPLACE "${scalar_write}" [=[    if (bitsize == 32 || bitsize == 64) {
 write_derived("${PORT_BUILD_DIR}/scalar_impl.cpp" "${scalar_source}")
 file(READ "${PROJECT_SOURCE_DIR}/src/dynarmic/src/${translator_relative}/a64_translate.cpp" translator)
 string(REPLACE "${translator_relative}/impl/impl.cpp" "${PORT_BUILD_DIR}/scalar_impl.cpp" translator "${translator}")
+if(EDEN_FAST_PATHS_SYSTEM)
+    eden_fast_paths_require("${translator}" "${translator_relative}/impl/system.cpp" "a64_translate.cpp system.cpp include")
+    string(REPLACE "${translator_relative}/impl/system.cpp" "${EDEN_FAST_PATHS_SYSTEM}" translator "${translator}")
+endif()
 write_derived("${PORT_BUILD_DIR}/a64_translate.cpp" "${translator}")
 get_target_property(jit_sources dynarmic SOURCES)
 list(FILTER jit_sources EXCLUDE REGEX "(^|/)a64_translate\\.cpp$")
@@ -583,6 +592,27 @@ string(REPLACE "${fastmem_declaration}" "${exclusive_lookup}${fastmem_declaratio
 if(EDEN_SHARED_JIT)
     eden_shared_jit_memory_header()
 endif()
+# Ordered reads (LDAR, LDAPR, and every exclusive read: LDXR/LDAXR) were a locked RMW of zero
+# (lock xadd), ~20 cycles and a full barrier each; a game's job and object-table code runs them in
+# its hottest blocks. Under x86-TSO a naturally aligned 8-64-bit load is atomic and already has
+# acquire semantics, and ordered writes stay xchg (a full barrier), so a plain load keeps ARM's
+# STLR->LDAR order: the usual sequentially consistent mapping (load = mov, store = xchg). Exclusive
+# reads stay correct because misaligned ones leave for the callback and the exclusive write's
+# lock cmpxchg compares against the value read. 128-bit reads keep cmpxchg16b (a 16-byte load is
+# not atomic). EDEN_JIT_PLAIN_ORDERED=1 (main.cpp) turns it on; off is the locked read.
+# Ported from Swordpdf/ProsperoEden PR 189, commit 64a1ee754a3b (Rockiu0), GPL-3.0-or-later.
+set(ordered_read_old [=[const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {
+    if (ordered) {
+]=])
+string(FIND "${memory_emitter}" "${ordered_read_old}" ordered_read_at)
+if(ordered_read_at LESS 0)
+    message(FATAL_ERROR "Pinned EmitReadMemoryMov changed")
+endif()
+string(REPLACE "${ordered_read_old}" [=[const void* EmitReadMemoryMov(BlockOfCode& code, int value_idx, const Xbyak::RegExp& addr, bool ordered) {
+    if (ordered && (bitsize == 128 || !__atomic_load_n(&eden_plain_ordered_reads, __ATOMIC_RELAXED))) {
+]=] memory_emitter "${memory_emitter}")
+string(REPLACE "#pragma once\n" "#pragma once\nextern \"C\" bool eden_plain_ordered_reads;  // ProsperoEden (CMakeLists.txt, ordered reads)\n"
+    memory_emitter "${memory_emitter}")
 write_derived("${PORT_BUILD_DIR}/include/${memory_relative}" "${memory_emitter}")
 # New include overlays do not invalidate objects whose depfile still names
 # upstream headers. Derive both translation units so the first build cannot
