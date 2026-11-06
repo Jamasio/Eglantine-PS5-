@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eglantine PS5 <noreply@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 01:30:00 +0100
+Subject: [PATCH] Buffer usage tracking: do not refill pages already full
+
+Core patch. Paths are the submodule's. Applies on core16 alone or in the lichii-cpu order.
+
+Source: zortos293/Lichii PR 184, commit 440f0c2ac4, GPL-3.0-or-later.
+
+UsageTracker::Track keeps the run of pages it knows are all ones and fills only around it. No switch:
+the pages end up the same, so behaviour cannot change. Our four-entry recent list already skips exact
+repeats; this helps the same big binding at a new offset or size.
+
+Pool memory: 16 bytes per buffer.
+
+Checked: 1.5 million random Track and Reset calls on the Mac, pages equal to the plain loop after each
+one. PS5-target syntax compile of the derived vk_buffer_cache_cost.cpp, 0 errors.
+
+diff --git a/src/video_core/buffer_cache/usage_tracker.h b/src/video_core/buffer_cache/usage_tracker.h
+index 3e2da8bc0b..b2c6c444ec 100644
+--- a/src/video_core/buffer_cache/usage_tracker.h
++++ b/src/video_core/buffer_cache/usage_tracker.h
+@@ -6,6 +6,7 @@
+ 
+ #pragma once
+ 
++#include <algorithm>
+ #include <array>
+ #include <utility>
+ #include <vector>
+@@ -29,6 +30,8 @@ public:
+     void Reset() noexcept {
+         std::ranges::fill(pages, 0ULL);
+         recent.fill({~u64{0}, 0});
++        full_begin = 0;
++        full_end = 0;
+     }
+ 
+     void Track(u64 offset, u64 size) noexcept {
+@@ -50,9 +53,7 @@ public:
+         if (page == page_end) {
+             return;
+         }
+-        for (size_t i = page + 1; i < page_end; i++) {
+-            pages[i] = ~u64{0};
+-        }
++        FillPages(page + 1, page_end);
+         const size_t offset_end = offset + size;
+         const size_t offset_end_page_aligned = Common::AlignDown(offset_end, BUFFER_PAGE_BYTES);
+         TrackPage(page_end, offset_end_page_aligned, offset_end - offset_end_page_aligned);
+@@ -78,6 +79,32 @@ public:
+     }
+ 
+ private:
++    /// pages[begin, end) = all ones. Pages in [full_begin, full_end) are all ones already (only
++    /// Reset clears a page): fill around that run and grow it, so tracking a multi-megabyte
++    /// binding again at another offset costs nothing once it is filled. The result is the same
++    /// as the plain loop, so this has no switch. Lichii PR 184, commit 440f0c2ac4.
++    void FillPages(size_t begin, size_t end) noexcept {
++        if (begin >= end) {
++            return;
++        }
++        if (end < full_begin || begin > full_end) {
++            std::fill(pages.begin() + begin, pages.begin() + end, ~u64{0});
++            if (end - begin > full_end - full_begin) {
++                full_begin = begin;
++                full_end = end;
++            }
++            return;
++        }
++        if (begin < full_begin) {
++            std::fill(pages.begin() + begin, pages.begin() + full_begin, ~u64{0});
++        }
++        if (end > full_end) {
++            std::fill(pages.begin() + full_end, pages.begin() + end, ~u64{0});
++        }
++        full_begin = (std::min)(begin, full_begin);
++        full_end = (std::max)(end, full_end);
++    }
++
+     void TrackPage(u64 page, u64 offset, u64 size) noexcept {
+         const size_t offset_in_page = offset % BUFFER_PAGE_BYTES;
+         const size_t first_bit = offset_in_page >> BUFFER_BYTES_PER_BITSHIFT;
+@@ -100,6 +127,9 @@ private:
+     /// Ranges tracked last, (offset, size).
+     std::array<std::pair<u64, u64>, 4> recent{{{~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}, {~u64{0}, 0}}};
+     size_t recent_cursor{};
++    /// Pages known to be all ones (FillPages).
++    size_t full_begin{};
++    size_t full_end{};
+ };
+ 
+ } // namespace VideoCommon

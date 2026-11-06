@@ -1,0 +1,226 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Eglantine PS5 <noreply@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 01:30:00 +0100
+Subject: [PATCH] Vulkan: a fragment barrier ends the render pass only when a draw needs it (off by default)
+
+Core patch. Paths are the submodule's. Applies on core16 alone or in the lichii-cpu order.
+
+Source: zortos293/Lichii PR 161, commit 3985ac21c6, and PR 184, commit 60e565c440 (a pending barrier
+survives unrelated draws), GPL-3.0-or-later. PR 161 was still open on 6 Nov; PR 184 is merged.
+Lichii had the deferred path for MoltenVK already; this core had none of it, so the scheduler state,
+writes_storage and SamplesRenderTarget come along.
+
+EDEN_NX2_DEFER_FRAGMENT_BARRIER=1: FRAGMENT_BARRIER inside a render pass marks the pass. The next
+draw ends it only if it samples a bound render target, or if the pass wrote storage. Unset, or with
+no pass active, it is the old call.
+
+Added here: DrawTexture does not go through ConfigureImpl, so it takes a pending barrier at once.
+The colour feedback copies (ReplaceColorFeedbackViews) end the pass themselves. writes_storage and
+NoteRenderPassStores sit a few lines lower than in Lichii, to stay clear of the lines
+fable-mesh-compute-0181 changes; this patch applies before or after that one.
+
+Why it may matter on the console: PR 161 counts about 5,900 render passes a second in Ocarina on a
+PC. The barrier count per frame comes from the game, so it should carry over; the fps numbers do
+not. Each pass end costs the Vulkan worker a barrier and the GPU a drain. run61 shows only 3.4 ms of
+a 42 ms frame on the fence, so a frame rate gain is not expected unless the worker is the limit.
+
+Risk: a texture view that aliases a render target through a different image is not seen by
+SamplesRenderTarget. Compare the picture with the switch on and off.
+
+Pool memory: none.
+
+Checked: PS5-target syntax compile of the derived files (vulkan_rasterizer.cpp,
+vk_graphics_pipeline_cost.cpp, vulkan_scheduler.cpp, vk_texture_cache_cost.cpp): 0 errors.
+prepare-vulkan-port.py reports the same anchors as core16 and carries the edits. Not run.
+
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 96a819983b..1f166d0f6d 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -313,6 +313,13 @@ GraphicsPipeline::GraphicsPipeline(
+     uses_descriptor_buffer = builder.CanUseDescriptorBuffer() && descriptor_buffer_ring.IsValid();
+     descriptor_set_layout =
+         builder.CreateDescriptorSetLayout(uses_push_descriptor, uses_descriptor_buffer);
++    const auto any_written = [](const auto& descriptors) {
++        return std::ranges::any_of(descriptors, [](const auto& desc) { return desc.is_written; });
++    };
++    writes_storage = std::ranges::any_of(stage_infos, [&](const Shader::Info& info) {
++        return info.stores_global_memory || any_written(info.storage_buffers_descriptors) ||
++               any_written(info.image_descriptors) || any_written(info.image_buffer_descriptors);
++    });
+     if (uses_descriptor_buffer) {
+         descriptor_buffer_layout = builder.MakeDescriptorBufferLayout(*descriptor_set_layout);
+         if (!descriptor_buffer_ring.CanAllocate(descriptor_buffer_layout.size)) {
+@@ -670,8 +677,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
+     {
+         Profile::Scope scope{Profile::Zone::RenderTargets};
+         texture_cache.UpdateRenderTargets(false);
+-        texture_cache.CheckFeedbackLoop(
+-            std::span<const VideoCommon::ImageViewInOut>{views.data(), views.size()});
++        const std::span<const VideoCommon::ImageViewInOut> view_span{views.data(), views.size()};
++        texture_cache.CheckFeedbackLoop(view_span);
++        if (scheduler.HasFragmentBarrier() &&
++            (scheduler.RenderPassHasStores() || texture_cache.SamplesRenderTarget(view_span))) {
++            scheduler.RequestOutsideRenderPassOperationContext();
++        }
+     }
+     if (IsBuilt() && !pipeline) {
+         return false;
+@@ -733,6 +744,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+         });
+     }
++    if (writes_storage) {
++        scheduler.NoteRenderPassStores();
++    }
+     const bool is_rescaling{texture_cache.IsRescaling()};
+     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling)};
+     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index d4431a0f7b..462e6ea86d 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -231,6 +231,8 @@ private:
+     size_t num_image_elements{};
+     u32 num_textures{};
+     bool fragment_has_color0_output{};
++    /// A stage writes global memory, a storage buffer or an image.
++    bool writes_storage{};
+ 
+     vk::DescriptorSetLayout descriptor_set_layout;
+     DescriptorAllocator descriptor_allocator;
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 2e1887ea5a..d14a7268ff 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -1108,6 +1108,10 @@ void RasterizerVulkan::DrawTexture() {
+     std::scoped_lock l{texture_cache.mutex};
+     texture_cache.SynchronizeDescriptors(false);
+     texture_cache.UpdateRenderTargets(false);
++    // A deferred fragment barrier: this draw does not pass through GraphicsPipeline::ConfigureImpl.
++    if (scheduler.HasFragmentBarrier()) {
++        scheduler.RequestOutsideRenderPassOperationContext();
++    }
+ 
+     UpdateDynamicStates();
+ 
+@@ -1719,6 +1723,19 @@ void RasterizerVulkan::WaitForIdle() {
+ }
+ 
+ void RasterizerVulkan::FragmentBarrier() {
++    // EDEN_NX2_DEFER_FRAGMENT_BARRIER=1: the next draw ends the render pass only if it samples a
++    // render target of the pass, or the pass wrote storage (GraphicsPipeline::ConfigureImpl).
++    // Ocarina of Time asks for ~100 of these a frame and nearly all follow unrelated draws. Lichii
++    // PR 161 (commit 3985ac21c6) and PR 184 (commit 60e565c440, a pending barrier survives
++    // unrelated draws).
++    static const bool defer = [] {
++        const char* value = std::getenv("EDEN_NX2_DEFER_FRAGMENT_BARRIER");
++        return value != nullptr && value[0] == '1';
++    }();
++    if (defer && scheduler.IsRenderPassActive()) {
++        scheduler.DeferFragmentBarrier();
++        return;
++    }
+     // We already put barriers when a render pass finishes
+     scheduler.RequestOutsideRenderPassOperationContext();
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index ce1851d293..89d2675af3 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -497,6 +497,8 @@ void Scheduler::EndRenderPass()
+         if (!state.renderpass) {
+             return;
+         }
++        fragment_barrier_pending = false;
++        render_pass_has_stores = false;
+ 
+         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.h b/src/video_core/renderer_vulkan/vk_scheduler.h
+index e102c82260..bec1f26a70 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.h
++++ b/src/video_core/renderer_vulkan/vk_scheduler.h
+@@ -106,6 +106,25 @@ public:
+         return state.renderpass != VK_NULL_HANDLE;
+     }
+ 
++    /// EDEN_NX2_DEFER_FRAGMENT_BARRIER=1: the fragment barrier of an active render pass waits for
++    /// a draw that needs it (GraphicsPipeline::ConfigureImpl). Ending the pass clears it.
++    void DeferFragmentBarrier() {
++        fragment_barrier_pending = true;
++    }
++
++    bool HasFragmentBarrier() const {
++        return fragment_barrier_pending;
++    }
++
++    /// A draw of the active render pass writes storage: a later barrier must end the pass.
++    void NoteRenderPassStores() {
++        render_pass_has_stores = true;
++    }
++
++    bool RenderPassHasStores() const {
++        return render_pass_has_stores;
++    }
++
+     /// Update the pipeline to the current execution context.
+     bool UpdateGraphicsPipeline(GraphicsPipeline* pipeline);
+ 
+@@ -358,6 +377,8 @@ private:
+     const Device& device;
+     StateTracker& state_tracker;
+ 
++    bool fragment_barrier_pending{};
++    bool render_pass_has_stores{};
+     std::unique_ptr<MasterSemaphore> master_semaphore;
+     std::unique_ptr<CommandPool> command_pool;
+ 
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index a514b7dc78..f4e6b89171 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -658,6 +658,29 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
+     }
+ }
+ 
++template <class P>
++bool TextureCache<P>::SamplesRenderTarget(std::span<const ImageViewInOut> views) {
++    if (rt_active_mask == 0) {
++        return false;
++    }
++    const bool depth_active = (rt_active_mask & (1u << NUM_RT)) != 0;
++    for (const auto& view : views) {
++        if (!view.id) {
++            continue;
++        }
++        const ImageId image_id = slot_image_views[view.id].image_id;
++        if (depth_active && image_id == rt_depth_image_id) {
++            return true;
++        }
++        for (size_t i = 0; i < NUM_RT; ++i) {
++            if ((rt_active_mask & (1u << i)) != 0 && image_id == rt_image_id[i]) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
+ template <class P>
+ void TextureCache<P>::CheckFeedbackLoop(std::span<const ImageViewInOut> views) {
+     if (!Settings::values.barrier_feedback_loops.GetValue()) {
+diff --git a/src/video_core/texture_cache/texture_cache_base.h b/src/video_core/texture_cache/texture_cache_base.h
+index 8a105cc1ab..b3376943c0 100644
+--- a/src/video_core/texture_cache/texture_cache_base.h
++++ b/src/video_core/texture_cache/texture_cache_base.h
+@@ -271,6 +271,9 @@ public:
+     /// Handle feedback loops during draws.
+     void CheckFeedbackLoop(std::span<const ImageViewInOut> views);
+ 
++    /// True when a view is of an image bound as a render target.
++    [[nodiscard]] bool SamplesRenderTarget(std::span<const ImageViewInOut> views);
++
+     /// Get the sampler from the graphics/compute descriptor table in the specified index
+     Sampler* GetSampler(u32 index, bool compute);
+ 
