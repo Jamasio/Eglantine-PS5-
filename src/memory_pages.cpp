@@ -311,11 +311,19 @@ extern "C" int eden_direct_low(std::size_t size, std::size_t alignment, int type
 #ifdef PS5_NATIVE
 std::int64_t zero_block = -1;
 
+// Where a slot's short-lived view of a block goes. A view asks for the first gap at or after the
+// address, and at cpu_mapping_hint that can be the gap a heap piece leaves between DecommitMemoryRange's
+// munmap and its reservation, MAP_FIXED, which then takes the view's mapping away. These views are
+// made in the fault handler, so the clear that follows faults inside it (run 59's analysis found this
+// route; no run has shown it). EDEN_SLOT_VIEW_HIGH=1 (ServiceStart) puts them high above the heap.
+std::atomic<std::uintptr_t> slot_view_hint{cpu_mapping_hint};
+constexpr std::uintptr_t slot_view_high = 0x3800000000ull;
+
 // A 2 MiB block of direct memory, zeroed through a mapping of its own that is gone again.
 bool ZeroedBlock(std::int64_t* physical) {
     if (eden_direct_low(SparseSlot, SparseSlot, 12, physical) != 0)
         return false;
-    void* view = reinterpret_cast<void*>(cpu_mapping_hint);
+    void* view = reinterpret_cast<void*>(slot_view_hint.load(std::memory_order_relaxed));
     if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, *physical, SparseSlot) != 0) {
         (void)sceKernelReleaseDirectMemory(*physical, SparseSlot);
         return false;
