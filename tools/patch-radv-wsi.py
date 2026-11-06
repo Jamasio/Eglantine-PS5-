@@ -79,6 +79,52 @@ DRIVER_ADAPTATIONS = {
          'static void\nradv_task_emu_draw_indirect(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info)\n{\n'
          '   radv_task_emu_depth++;\n   radv_task_emu_draw_indirect_body(cmd_buffer, info);\n   radv_task_emu_depth--;\n}\n\n'
          'static void\nradv_task_emu_draw_indirect_body(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info)\n{'),
+        # EglantinePS5: a command buffer's upload buffer (push descriptors, push constants, vertex
+        # descriptors) only ever doubles and stays at the largest size any recording needed, and the
+        # pool cycles through every command buffer it ever made. With EDEN_RADV_UPLOAD_TRIM_KIB=<n> one over
+        # n KiB that 64 recordings in a row used less than a quarter of is given back at reset; the
+        # next recording starts small and grows as before. Heyde Moura measured these buffers and the
+        # descriptor pools at 256 MiB and rising on Mario Kart World (EglantinePS5 f25ee25ffe).
+        ('static void\nradv_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer, UNUSED VkCommandBufferResetFlags flags)\n{',
+         '''#include <stdlib.h>
+
+static void
+eden_upload_trim(struct radv_cmd_buffer *cmd_buffer)
+{
+   static int64_t limit = -1;
+   if (limit < 0) {
+      const char *const value = getenv("EDEN_RADV_UPLOAD_TRIM_KIB");
+      limit = value ? (int64_t)strtoull(value, NULL, 10) << 10 : 0;
+   }
+   if (!limit || !cmd_buffer->upload.upload_bo)
+      return;
+   if (cmd_buffer->upload.size <= (uint64_t)limit || (uint64_t)cmd_buffer->upload.offset * 4 >= cmd_buffer->upload.size) {
+      cmd_buffer->upload.small_recordings = 0;
+      return;
+   }
+   if (++cmd_buffer->upload.small_recordings < 64)
+      return;
+   struct radv_device *device = radv_cmd_buffer_device(cmd_buffer);
+   radv_rmv_log_command_buffer_bo_destroy(device, cmd_buffer->upload.upload_bo);
+   radv_bo_destroy(device, &cmd_buffer->vk.base, cmd_buffer->upload.upload_bo);
+   cmd_buffer->upload.upload_bo = NULL;
+   cmd_buffer->upload.map = NULL;
+   cmd_buffer->upload.size = 0;
+   cmd_buffer->upload.small_recordings = 0;
+}
+
+static void
+radv_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer, UNUSED VkCommandBufferResetFlags flags)
+{'''),
+        ('   if (cmd_buffer->upload.upload_bo)\n      radv_cs_add_buffer(device->ws, cs->b, cmd_buffer->upload.upload_bo);\n   cmd_buffer->upload.offset = 0;\n',
+         '   eden_upload_trim(cmd_buffer);\n'
+         '   if (cmd_buffer->upload.upload_bo)\n      radv_cs_add_buffer(device->ws, cs->b, cmd_buffer->upload.upload_bo);\n   cmd_buffer->upload.offset = 0;\n'),
+    ],
+    'src/amd/vulkan/radv_cmd_buffer.h': [
+        ('   struct radeon_winsys_bo *upload_bo;\n   struct list_head list;\n};\n',
+         '   struct radeon_winsys_bo *upload_bo;\n   struct list_head list;\n'
+         '   /* EglantinePS5: recordings in a row that used under a quarter of it (eden_upload_trim). */\n'
+         '   unsigned small_recordings;\n};\n'),
     ],
     'src/amd/vulkan/radv_physical_device.c': [
         ('   if (result == VK_ERROR_INCOMPATIBLE_DRIVER || result == VK_ERROR_INITIALIZATION_FAILED)\n      return VK_SUCCESS;',
