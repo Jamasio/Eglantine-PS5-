@@ -1,0 +1,215 @@
+From: SinCuri0 <SinCuri0@gmail.com>
+Subject: [PATCH] vulkan: keep task and mesh pipelines on disk, in a file of their own (EDEN_NX2_MESH_DISK_CACHE)
+
+Core patch, for tools/eglantine-patches after pipeline-keep-01.
+
+Port of the mesh half of zortos293/Lichii PR 192 (open, not merged), SinCuri0, branch
+disk-cache-mesh-pipelines, commit b8e8e0a5c058d1dc5bf2465794ecc4eb907ed7d4. GPL-3.0, as this tree.
+
+CreateGraphicsPipeline() returned before SerializePipeline for a mesh pipeline, and the loader
+dropped any it found, because the entry format has no mesh registers. So each session built them
+again, whatever was saved. The environments now also write mesh_registers and
+mesh_primitive_header, the two values translation reads from the live registers.
+
+Use this once mesh draws run (real ones, or fable-mesh-compute-0181). While they are skipped,
+EDEN_NX2_NO_MESH_BUILD is better: this only moves the work to boot, the pipelines are still built.
+With both set, the file is left alone.
+
+Changed from the source:
+- A switch: EDEN_NX2_MESH_DISK_CACHE=1. Default off: nothing is written or read, as before.
+- Own file, vulkan_mesh.bin, instead of new entries in vulkan.bin. The PR keeps the cache version
+  and reads the two values for every task or mesh entry. An entry written before they were left
+  out has no such values, and the loader's old comment says those can exist. The PS5's reader
+  (headless/shader_cache_reader.inc, which replaces LoadPipelines) takes that for damage and cuts
+  the file back: in a test, made-up entries, a 1436-byte vulkan.bin with one stale entry lost it and
+  all that followed, 424 bytes left. Core's LoadPipelines was seen to throw std::bad_alloc there,
+  which it does not catch, and to spin for over a minute without the change on a file with mesh
+  entries (once each, made-up data; not the PS5's path). With an own file none of this can touch
+  vulkan.bin, a build without this patch never opens it, and a damaged one takes only itself with
+  it. CACHE_VERSION is unchanged.
+- FileEnvironment::read_mesh_fields tells Deserialize which file it reads, set around the second
+  load. Not a LoadPipelines argument: the PS5 build compiles its own LoadPipelines, which calls
+  Deserialize(file), so a new argument leaves the call without a definition at link, and without
+  the values the reader cuts vulkan_mesh.bin back to its header every boot.
+- The trap prefix half of the PR is left out: this tree has no trap_prefix and CanBeSerialized never
+  refused those programs.
+
+Test results, on the Mac, real shader_environment.cpp, made-up entries, both the PS5 reader and
+core's: an old file with a stale mesh entry reads through with the flag off and is not cut; task,
+mesh, registers, primitive header and key come back from vulkan_mesh.bin unchanged, not cut. PS5
+reader only: a cut tail keeps the whole entries before it. Plain entries are untouched by the diff.
+GenericEnvironment::Serialize writes the new values for every task or mesh entry, but only this path
+stores any: OpenGL throws on those programs.
+
+The PR's table is from an RTX 5070 Ti; its numbers do not carry over.
+
+Memory: mesh pipelines used in the last two sessions are built at boot. Not run on a console.
+Syntax checked with clang (stubs for the SDK).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index fb6f0fdb27..cf367887f8 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -694,6 +694,18 @@ bool PreloadAllPipelines() {
+     }();
+     return all;
+ }
++
++// EDEN_NX2_MESH_DISK_CACHE=1 keeps task and mesh pipelines in <title>/vulkan_mesh.bin, so that a
++// session builds them at boot like the rest. Off, they are built on the GPU thread every session.
++// Their own file, not vulkan.bin: an entry there has the mesh registers, an entry from before task
++// and mesh pipelines were left out does not, and the two cannot be told apart while reading.
++bool MeshDiskCache() {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_NX2_MESH_DISK_CACHE");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
+ } // Anonymous namespace
+ 
+ bool DropMeshDrawsBeforeBuild() {
+@@ -818,6 +830,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+     }
+     pipeline_cache_filename = base_dir / "vulkan.bin";
+     used_pipelines_filename = base_dir / "vulkan_used.bin";
++    if (MeshDiskCache() && !DropMeshDrawsBeforeBuild()) {
++        mesh_pipeline_cache_filename = base_dir / "vulkan_mesh.bin";
++    }
+     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
+     used_pipelines_saved = std::chrono::steady_clock::now();
+     size_t skipped_pipelines = 0;
+@@ -858,13 +873,14 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+         });
+         ++state.total;
+     }};
++    bool reading_mesh_file = false;
+     const auto load_graphics{[&](std::ifstream& file, std::vector<FileEnvironment> envs) {
+         GraphicsPipelineCacheKey key;
+         file.read(reinterpret_cast<char*>(&key), sizeof(key));
+ 
+-        // Task/mesh pipelines are not stored (their mesh registers are not in the format); skip
+-        // any that were.
+-        if (std::ranges::any_of(envs, [](const FileEnvironment& env) {
++        // Task/mesh pipelines are not stored in vulkan.bin (their mesh registers are not in its
++        // format, see MeshDiskCache); skip any that were.
++        if (!reading_mesh_file && std::ranges::any_of(envs, [](const FileEnvironment& env) {
+                 return env.ShaderStage() == Shader::Stage::Task ||
+                        env.ShaderStage() == Shader::Stage::Mesh;
+             })) {
+@@ -931,6 +947,15 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+     }};
+     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
+                                load_graphics);
++    if (!mesh_pipeline_cache_filename.empty()) {
++        reading_mesh_file = true;
++        FileEnvironment::read_mesh_fields = true;
++        SCOPE_EXIT {
++            FileEnvironment::read_mesh_fields = false;
++        };
++        VideoCommon::LoadPipelines(stop_loading, mesh_pipeline_cache_filename, CACHE_VERSION,
++                                   load_compute, load_graphics);
++    }
+ 
+     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+     if (skipped_pipelines != 0) {
+@@ -1443,10 +1468,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+     if (!pipeline || pipeline_cache_filename.empty()) {
+         return pipeline;
+     }
+-    if (pipeline->IsMeshPipeline()) {
++    const bool is_mesh{pipeline->IsMeshPipeline()};
++    if (is_mesh) {
+         reason = RuntimeBuild::Mesh;
+-        // Not stored: task and mesh programs are translated with the mesh registers, which the
+-        // cache format does not carry. The few of them rebuild quickly from the driver cache.
++    }
++    if (is_mesh && mesh_pipeline_cache_filename.empty()) {
++        // Not stored: task and mesh programs are translated with the mesh registers, which
++        // vulkan.bin does not carry. They are built again on this thread every session, driver
++        // cache or not (EDEN_NX2_MESH_DISK_CACHE).
+         QueueVulkanPipelineCacheFlush();
+         return pipeline;
+     }
+@@ -1456,7 +1485,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+         return pipeline;
+     }
+     disk_pipelines.insert(graphics_key.Hash());
+-    serialization_thread.QueueWork([this, key = graphics_key, envs = std::move(environments.envs)] {
++    serialization_thread.QueueWork([this, is_mesh, key = graphics_key,
++                                    envs = std::move(environments.envs)] {
+         try {
+             boost::container::static_vector<const GenericEnvironment*, Maxwell::MaxShaderProgram>
+                 env_ptrs;
+@@ -1465,7 +1495,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline() {
+                     env_ptrs.push_back(&envs[index]);
+                 }
+             }
+-            SerializePipeline(key, env_ptrs, pipeline_cache_filename, CACHE_VERSION);
++            SerializePipeline(key, env_ptrs,
++                              is_mesh ? mesh_pipeline_cache_filename : pipeline_cache_filename,
++                              CACHE_VERSION);
+         } catch (const std::bad_alloc&) {
+             SurviveBadAlloc("a graphics pipeline's disk cache entry");
+         }
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.h b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+index 8938d4b50f..df63fd65de 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.h
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.h
+@@ -203,6 +203,7 @@ private:
+     Shader::HostTranslateInfo host_info;
+ 
+     std::filesystem::path pipeline_cache_filename;
++    std::filesystem::path mesh_pipeline_cache_filename; ///< Empty unless EDEN_NX2_MESH_DISK_CACHE=1
+ 
+     /// Key hashes of the graphics pipelines in the disk cache. Only those a recent session used
+     /// (used_pipelines) are built at boot; the rest are built when first needed, and not stored
+diff --git a/src/video_core/shader_environment.cpp b/src/video_core/shader_environment.cpp
+index 7969939e6e..c1233232cb 100644
+--- a/src/video_core/shader_environment.cpp
++++ b/src/video_core/shader_environment.cpp
+@@ -326,6 +326,13 @@ void GenericEnvironment::Serialize(std::ofstream& file) const {
+             file.write(reinterpret_cast<const char*>(&gp_passthrough_mask),
+                        sizeof(gp_passthrough_mask));
+         }
++        // Only vulkan_mesh.bin holds task and mesh programs; FileEnvironment::Deserialize reads
++        // this with read_mesh_fields set.
++        if (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh) {
++            file.write(reinterpret_cast<const char*>(&mesh_registers), sizeof(mesh_registers))
++                .write(reinterpret_cast<const char*>(&mesh_primitive_header),
++                       sizeof(mesh_primitive_header));
++        }
+     }
+ }
+ 
+@@ -909,6 +916,12 @@ void FileEnvironment::Deserialize(std::ifstream& file) {
+         if (stage == Shader::Stage::Geometry) {
+             file.read(reinterpret_cast<char*>(&gp_passthrough_mask), sizeof(gp_passthrough_mask));
+         }
++        if (read_mesh_fields &&
++            (stage == Shader::Stage::Task || stage == Shader::Stage::Mesh)) {
++            file.read(reinterpret_cast<char*>(&mesh_registers), sizeof(mesh_registers))
++                .read(reinterpret_cast<char*>(&mesh_primitive_header),
++                      sizeof(mesh_primitive_header));
++        }
+     }
+     // Native programs fold bank 1 reads as they did when they were built.
+     is_proprietary_driver = texture_bound == 2 || Shader::Ampere::HasNativeAddressMap(code);
+diff --git a/src/video_core/shader_environment.h b/src/video_core/shader_environment.h
+index f1f9398fcb..af7fe8133f 100644
+--- a/src/video_core/shader_environment.h
++++ b/src/video_core/shader_environment.h
+@@ -214,6 +214,11 @@ public:
+ 
+     void Deserialize(std::ifstream& file);
+ 
++    /// True while this thread reads vulkan_mesh.bin, whose task and mesh programs carry their mesh
++    /// registers. Not an argument of LoadPipelines: the PS5 port compiles its own LoadPipelines
++    /// (headless/shader_cache_reader.inc), which calls Deserialize(file).
++    static inline thread_local bool read_mesh_fields{};
++
+     [[nodiscard]] u64 ReadInstruction(u32 address) override;
+ 
+     [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
