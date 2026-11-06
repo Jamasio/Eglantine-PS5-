@@ -12,6 +12,9 @@ builds on the following projects, each under its own license.
   simpleini, sirit, SPIRV-Headers, Vulkan-Headers, Vulkan-Utility-Libraries,
   Vulkan Memory Allocator, ENet, frozen, cpp-httplib, nlohmann/json, and the time
   zone data. Each keeps its upstream license.
+- **[ProsperoEden](https://github.com/Swordpdf/ProsperoEden)**, GPL-3.0-or-later. Ported JIT work
+  by Rockiu0: the direct page table (`headless/jit-page-table.cmake`, PR 188, commit
+  b94216347b9a), by way of heydemoura/EglantinePS5 033e453471 (Heyde Moura).
 - **[Zortos Eglantine fork](https://github.com/zortos293/Eglantine)**,
   GPL-3.0-or-later. Referenced directly by the `Eglantine` submodule, including its
   core, native shader, readback, service, runtime and test changes. The maintained
