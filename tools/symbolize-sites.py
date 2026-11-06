@@ -14,6 +14,11 @@ asked for the memory (offsets from the image's start, as in a crash report):
 The app's code is execute-only on the console, so the app cannot check that an address follows a call.
 That is done here, with the image: addresses whose previous instruction is not a call are stale words of
 the stack and are left out, and the rest are named, nearest call first.
+
+A write by the emulated CPU has no call above it: the first 128 words above a JIT frame's stack pointer
+are dynarmic's spill slots (backend/x64/stack_layout.h), which still hold what earlier calls left at that
+depth. A row of KernelCore::GetCurrentEmuThread, __emutls_get_address, Xbyak::... or the scheduler is that:
+the game's own store, not those functions.
 """
 import re
 import shutil
@@ -21,9 +26,6 @@ import struct
 import subprocess
 import sys
 from pathlib import Path
-
-BASE = 0x400000
-
 
 def tool(*names):
     for name in names:
@@ -46,6 +48,10 @@ class Image:
                 '<IIQQQQQQ', d, phoff + i * phentsize)
             if p_type == 1:
                 self.loads.append((vaddr, offset, filesz))
+        # The lines hold offsets from the image's start. The console runs it at 0x400000, but
+        # llvm-pie.elf is linked at 0: adding 0x400000 here named every address after an unrelated
+        # function, and almost none followed a call, so nearly all rows came out as "?" hints.
+        self.base = min(load[0] for load in self.loads)
 
     def bytes_before(self, address, count):
         for vaddr, offset, size in self.loads:
@@ -108,14 +114,14 @@ def main():
     cache = {}
 
     def raw(offset):
-        out = subprocess.run([symbolizer, '-e', str(elf), '-f', '-C', '--no-inlines', hex(BASE + offset - 1)],
+        out = subprocess.run([symbolizer, '-e', str(elf), '-f', '-C', '--no-inlines', hex(image.base + offset - 1)],
                              capture_output=True, text=True).stdout.splitlines()
         return (out[0] if out else '?')[:110]
 
     def name(offset):
         """The function of an address that follows a call; None for any other (a stale word)."""
         if offset not in cache:
-            cache[offset] = raw(offset) if follows_call(image, BASE + offset) else None
+            cache[offset] = raw(offset) if follows_call(image, image.base + offset) else None
         return cache[offset]
 
     def show(title, rows, pattern):
