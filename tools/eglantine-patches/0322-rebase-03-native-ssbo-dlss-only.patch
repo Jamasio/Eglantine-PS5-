@@ -1,0 +1,83 @@
+buffer_cache: EDEN_NX2_SSBO_DLSS_ONLY=1 sizes native compute bindings from the mapping only in DLSS
+
+Port of Djihads80/Eglantine 8820bb79aa (rdenno, PR #571, on nx2 since 2026-11-05), in the form of
+PR #609 (Mcm190) and viejunerd/Eglantine-PS5- core patch 0047: every native binding keeps the
+device-contiguity clamp. GPL-3.0-or-later, as the core.
+
+Sizing every native compute binding from its mapping binds up to 8 MiB per buffer. The upstream
+reports: Hyrule Warriors' fights fall to a few fps, then hang (8820bb79aa); Mario Kart World 1.8.0
+reads back several GiB/s (#609). Our tree still does it.
+
+With the switch only passes of a game DLSS evaluation, and table pointers (0170's indirect_offset),
+size from the mapping. Other native compute bindings go back to the word after the pointer when it
+looks like a size, else up to 8 MiB. Graphics bindings are unchanged.
+
+Changed from the source: off unless EDEN_NX2_SSBO_DLSS_ONLY=1; table pointers stay mapping-sized,
+which 0170 needs and the source does not have. A member set for the length of
+BindComputeStorageBuffer carries the choice, not a new argument, so this does not touch the lines
+fog-03 changes. #609's VI2 pacing half (#547) is left out: it only acts once Mario Kart World's
+dynamic FPS patch applies.
+
+Risk: Ocarina of Time's culling reads may want the whole mapping. Try it on Mario Kart World first.
+
+Core patch. Nothing here has run on a console.
+
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 2d78b98a5c..1faecbae0a 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -812,6 +812,18 @@ void BufferCache<P>::UnbindComputeStorageBuffers() {
+ template <class P>
+ void BufferCache<P>::BindComputeStorageBuffer(size_t ssbo_index, u32 cbuf_index, u32 cbuf_offset,
+                                               bool is_written, u32 indirect_offset) {
++    // EDEN_NX2_SSBO_DLSS_ONLY=1: only DLSS passes size a native compute binding from the mapping.
++    // Doing it for every native dispatch binds up to 8 MiB per buffer: Hyrule Warriors' fights fell
++    // to a few fps, and Mario Kart World read back several GiB/s (upstream 8820bb79aa, PR #609).
++    static const bool dlss_only = [] {
++        const char* const value = std::getenv("EDEN_NX2_SSBO_DLSS_ONLY");
++        return value != nullptr && value[0] == '1';
++    }();
++    compute_binding_sized_by_descriptor =
++        dlss_only && indirect_offset == ~0U && !kepler_compute->IsDlssDispatch();
++    SCOPE_EXIT {
++        compute_binding_sized_by_descriptor = false;
++    };
+     if (ssbo_index >= channel_state->compute_storage_buffers.size()) [[unlikely]] {
+         LOG_ERROR(HW_GPU, "Storage buffer index {} exceeds maximum storage buffer count",
+                   ssbo_index);
+@@ -3144,7 +3156,7 @@ Binding BufferCache<P>::StorageBufferBinding(GPUVAddr ssbo_addr, u32 cbuf_index,
+         // A native (Switch 2) compute program's pointer is bare: the word after it is another
+         // parameter (a dimension, stride or texture handle), not an NVN buffer size. Taking it as
+         // one bound Fortune's Weave's DLSS input features to 266 bytes and dropped the rest.
+-        if (native_pointer) {
++        if (native_pointer && !compute_binding_sized_by_descriptor) {
+             return (std::min)(memory_layout_size, static_cast<u32>(8_MiB));
+         }
+         const u64 next_qword = gpu_memory->Read<u64>(ssbo_addr + 8);
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 8b82c5b0c0..c40b96ac96 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -774,6 +774,9 @@ private:
+     Common::RangeSet<DAddr> cpu_read_ranges;
+     bool download_cpu_read_ranges{};
+     Common::RangeSet<DAddr> gpu_modified_ranges;
++    /// The compute binding being made takes its size from the word after its pointer, if that
++    /// looks like a size (EDEN_NX2_SSBO_DLSS_ONLY=1).
++    bool compute_binding_sized_by_descriptor{};
+     std::deque<Common::RangeSet<DAddr>> committed_gpu_modified_ranges;
+ 
+     // Async Buffers
+diff --git a/src/video_core/engines/kepler_compute.h b/src/video_core/engines/kepler_compute.h
+index fa5c91adb4..6cafb47887 100644
+--- a/src/video_core/engines/kepler_compute.h
++++ b/src/video_core/engines/kepler_compute.h
+@@ -244,6 +244,8 @@ public:
+     }
+ 
+     bool IsNativeMode() const { return native_mode; }
++    /// Whether the dispatch being run is a pass of a game DLSS evaluation (Fortune's Weave).
++    bool IsDlssDispatch() const { return native_mode && dlss_chain.active; }
+     /// Whether the matrix multiplies (tensor-core instructions) of the program being dispatched
+     /// are emulated: in a game DLSS evaluation when the game's own network may draw, and always
+     /// for Donkey Kong Bananza.
