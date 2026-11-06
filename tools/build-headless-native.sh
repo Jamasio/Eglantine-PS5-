@@ -89,6 +89,7 @@ fi
 python3 -B "$root/headless/check_audio_shutdown.py" "$scratch/native-local/headless/core.cpp" "$scratch/source/src/core/core.cpp"
 python3 -B "$root/tools/check-load-failure.py"
 python3 -B "$root/tools/check-launcher-autoboot.py"
+python3 -B "$root/tools/check-test-harness.py"
 python3 -B "$root/tools/check-extracted-content.py"
 python3 -B "$root/tools/check-vfs-file-budget.py"
 python3 -B "$root/tools/check-nso-memory.py"

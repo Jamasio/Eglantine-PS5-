@@ -128,6 +128,7 @@ extern "C" bool eden_jit_shared;  // headless/dynarmic/jit_group_support.inc
 #endif
 #include "profiles.h"
 #include "stop_limit.h"
+#include "test_harness.h"
 namespace Common {
 void SetGuestMemoryFine(bool on) noexcept;
 bool SparseTablesAvailable() noexcept; // src/memory_pages.cpp
@@ -380,10 +381,12 @@ int main(int argc, char** argv) {
         // Whether Eden's large tables can be sparse on this console (src/memory_pages.cpp),
         // decided now: every session's log says it, with or without a game.
         (void)Common::SparseTablesAvailable();
+        bool stop_limit_restart = false;
         {
             // A game that would not stop made the app start again (stop_limit.h): this log says so.
             const std::string note = Eden::LogFile("stop-limit.txt");
-            if (std::remove(note.c_str()) == 0)
+            stop_limit_restart = std::remove(note.c_str()) == 0;
+            if (stop_limit_restart)
                 Eden::Report("exit", "The last game did not stop (or finish loading) within ten seconds of being "
                                      "asked to, so EglantinePS5 started again");
             Eden::StopLimit::Start(note);
@@ -510,6 +513,10 @@ int main(int argc, char** argv) {
             Eden::DevelopmentInput::IgnoreExisting(left_behind);
         }
 #endif
+#else
+        // Only a test run (EDEN_TEST_BOOT, below) starts a title by itself in a release.
+        bool autoboot_pending = false;
+        std::string development_id;
 #endif
         setenv("EDEN_NX2_SPARSE_UNBACKED", "1", 1);
         setenv("EDEN_HOST_RESERVE_TRANSFER", "1", 1);
@@ -522,6 +529,25 @@ int main(int argc, char** argv) {
                 if (entry.empty() || entry[0] == '#' || split == std::string::npos || split == 0) continue;
                 setenv(entry.substr(0, split).c_str(), entry.c_str() + split + 1, 1);
                 std::printf("EDEN_ENV %s\n", entry.c_str());
+            }
+        }
+        // Test runs (test_harness.h): nothing happens here without an EDEN_TEST_ setting.
+        Eden::TestHarness::Start();
+        if (const std::string& title = Eden::TestHarness::BootTitle(); !title.empty()) {
+            // As for the development title, and for a game that had to be left behind as well:
+            // the launcher opens with what it has to say, and the title is not booted into again.
+            // A start the computer did not ask for (test_harness.h) or a forwarded game: no boot.
+            const char* const skip = !Eden::TestHarness::BootArmed() ? "not_armed" :
+                                     !last_crash.report.empty() ? "crash" :
+                                     stop_limit_restart ? "stop_limit" :
+                                     !forwarded_game.empty() ? "forwarded" : nullptr;
+            if (!skip) {
+                development_id = title;
+                autoboot_pending = true;
+                Eden::TestHarness::MarkBooted();
+                Eden::Report("test", ("EDEN_TEST boot title=" + title).c_str());
+            } else {
+                Eden::Report("test", (std::string{"EDEN_TEST boot_skipped reason="} + skip).c_str());
             }
         }
         // The console's defaults for the core's switches (env.txt above wins). Without a fastmem
@@ -573,6 +599,10 @@ int main(int argc, char** argv) {
         Eden::Multiplayer::RoomClient rooms;
         for (;;) {
         Eden::StopLimit::End();  // whatever game ran before is gone
+        if (Eden::TestHarness::QuitAsked()) {
+            Eden::Report("exit", "Closed by test-quit");
+            return 0;
+        }
 #ifdef EDEN_PS5_OPENGL
         std::error_code trim_error;
         const auto cache_entries = Eden::ReadNativeDirectory(native_shader_cache, trim_error);
@@ -615,7 +645,6 @@ int main(int argc, char** argv) {
         } else {
         guest_fault_retries = 0;
         forwarded_session = false;
-#if defined(EDEN_DEV_PROFILE) || defined(EDEN_DEV_ROM_ID)
         if (std::exchange(autoboot_pending, false)) {
 #if defined(EDEN_DEV_ROM_ID) && !defined(EDEN_DEV_PROFILE)
         compatibility_probe = true;
@@ -650,10 +679,6 @@ int main(int argc, char** argv) {
             Eden::BootTrace::Line("opening the launcher");
             selected_game = SelectEglantinePS5Game(rooms, launch_error);
         }
-#else
-        Eden::BootTrace::Line("opening the launcher");
-        selected_game = SelectEglantinePS5Game(rooms, launch_error);
-#endif
         Eden::BootTrace::Line("launcher closed: %s", selected_game.empty() ? "no game (quit)" : "a game was chosen");
         }
         if (selected_game.empty()) {
@@ -1463,9 +1488,10 @@ int main(int argc, char** argv) {
 #if defined(EDEN_DEV_PROFILE) || defined(EDEN_DEV_ROM_ID)
                         // The runner's stand-in for the press: its input commands are read only
                         // once the game runs.
-                        const bool asked = std::remove(Eden::AppFile("leave-loading.txt").c_str()) == 0;
+                        const bool asked = std::remove(Eden::AppFile("leave-loading.txt").c_str()) == 0 ||
+                                           Eden::TestHarness::QuitAsked();
 #else
-                        const bool asked = false;
+                        const bool asked = Eden::TestHarness::QuitAsked();
 #endif
                         if (pad->TakeReturnToMenu() || asked) {
                             Eden::Report("exit", "Touchpad + L1 while the game loads: leaving as soon as it can be stopped");
@@ -1681,6 +1707,8 @@ int main(int argc, char** argv) {
                 [[maybe_unused]] double session_seconds = 0;  // guest-fault relaunch (PS5 only)
                 std::jthread input_worker;
                 if (pad) input_worker = std::jthread([&](std::stop_token stop) {
+                    // Empty without EDEN_TEST_SCRIPT and EDEN_TEST_RECORD (test_harness.h).
+                    Eden::TestHarness::Session test_session{pad->Mapping(), session_start, guest, game_title};
 #ifdef EDEN_DEV_PROFILE
                     // The timed input replay drives the profile's own title (EDEN_DEV_PROFILE_TITLE);
                     // other development titles take runner commands (compat-input.txt).
@@ -1807,12 +1835,14 @@ int main(int argc, char** argv) {
 #ifdef EDEN_DEV_PROFILE
                         if (!timed_replay) {
 #endif
+                        const auto test_sample = test_session.Sample();
 #if defined(EDEN_DEV_ROM_ID) || defined(MKW_DIAGNOSTIC_INPUT)
-                        if (!development_input.active) { UpdateGrips(system, *pad); pad->Poll(); }
+                        if (!development_input.active && !test_sample) { UpdateGrips(system, *pad); pad->Poll(); }
 #else
                         UpdateGrips(system, *pad);
-                        pad->Poll();
+                        if (!test_sample) pad->Poll();
 #endif
+                        if (test_sample) pad->Consume({&*test_sample, 1});
 #if defined(EDEN_DEV_ROM_ID) || defined(MKW_DIAGNOSTIC_INPUT)
                         const auto command_now = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1889,6 +1919,12 @@ int main(int argc, char** argv) {
                             std::lock_guard lock(completion->mutex);
                             completion->return_to_menu = true;
                             completion->room_lost = room_lost;
+                            completion->wake.notify_one();
+                            break;
+                        }
+                        if (Eden::TestHarness::QuitAsked()) {
+                            std::lock_guard lock(completion->mutex);
+                            completion->return_to_menu = true;
                             completion->wake.notify_one();
                             break;
                         }
