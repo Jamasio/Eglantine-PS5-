@@ -25,8 +25,9 @@ Also here:
   Not proven: docs/MKW-TITLE-FPS.md gives a cost measured on the console, and no log here shows it.
 
 Runs on the PS5: yes. Run61 logs the split and macros on the first thread.
-Behaviour with the switch off: same waits and order. WaitForSpace spins longer before it yields, and
-a full ring now sets wait_target, so the back hands space back sooner.
+Behaviour with the switch off: same waits and order. A full ring waits as it did: 4096 spins and no
+wait_target. With the switch on it spins longer and sets wait_target, so the back hands space back
+sooner. WaitForWriters' re-wake and 5 s warning are always there, and act only in a wait that is stuck.
 Hang: cannot add one. No new wait; one more place re-wakes a parked back.
 Pool memory: under 1 KiB.
 Checked: gpu_split.cpp built on the Mac with stubs and run under ThreadSanitizer, 2 sessions, front
@@ -123,7 +124,7 @@ index 9e4b8ae3b7..e3064021a2 100644
      const u32 word = dma_pusher.memory_manager.Read<u32>(address);
      const bool ready = operation == 0   ? word == payload
 diff --git a/src/video_core/gpu_split.cpp b/src/video_core/gpu_split.cpp
-index bbc67898c3..eadb7cd7d6 100644
+index bbc67898c3..0eea280b17 100644
 --- a/src/video_core/gpu_split.cpp
 +++ b/src/video_core/gpu_split.cpp
 @@ -4,6 +4,7 @@
@@ -234,7 +235,7 @@ index bbc67898c3..eadb7cd7d6 100644
  }
  
  void GpuSplit::Publish() {
-@@ -241,26 +264,116 @@ void GpuSplit::Drain() {
+@@ -241,26 +264,120 @@ void GpuSplit::Drain() {
      }
  }
  
@@ -263,7 +264,12 @@ index bbc67898c3..eadb7cd7d6 100644
      if (consumed_cache >= target) {
          return false;
      }
-     wait_target.store(target, std::memory_order_seq_cst);
+-    wait_target.store(target, std::memory_order_seq_cst);
++    // Without EDEN_NX2_SPLIT_WAITS a full ring waits as WaitForSpace did: no early hand-back.
++    const bool plain_ring_wait = site == DrainSite::RingFull && !SplitWaitsEnabled();
++    if (!plain_ring_wait) {
++        wait_target.store(target, std::memory_order_seq_cst);
++    }
      Publish();
 +    Nx2Profile::Scope scope{Nx2Profile::Zone::SplitDrain};
 +    const u64 start = SplitWaitsEnabled() ? WaitClockNs() : 0;
@@ -275,7 +281,8 @@ index bbc67898c3..eadb7cd7d6 100644
 -            return true;
 +            break;
          }
-         if (spins < 16384) {
+-        if (spins < 16384) {
++        if (spins < (plain_ring_wait ? 4096u : 16384u)) {
              Pause();
 -        } else {
 -            std::this_thread::yield();
@@ -356,7 +363,7 @@ index bbc67898c3..eadb7cd7d6 100644
  }
  
  void GpuSplit::SwitchEngine(Tegra::Engines::EngineInterface* engine) {
-@@ -371,6 +484,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
+@@ -371,6 +488,7 @@ void GpuSplit::BackLoop(std::stop_token stop_token) {
          u64 available = published.load(std::memory_order_acquire);
          if (available == read_position) {
              Nx2Profile::Scope scope{Nx2Profile::Zone::SplitWait};
