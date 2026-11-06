@@ -13,8 +13,9 @@ large request when the console has no memory for a block of its own, the heap fi
 that hold nothing are given back (eden_heap_trim) while six threads take and free blocks of the
 spaces, a given-back piece being unreadable until it is committed again, and the heap's range is
 filled again after a trim; a large block takes memory in pieces when no one piece is free. Empty
-arenas go back to their spaces when their thread ends and when the heap is trimmed, while other
-threads take and free small blocks, and stay with EDEN_HEAP_KEEP_ARENAS set.
+arenas leave their records for the spares when their thread ends and when the heap is trimmed,
+while other threads take and free small blocks, the next threads take the spares before the heap
+makes new arenas, and every arena stays with its record with EDEN_HEAP_KEEP_ARENAS set.
 """
 import pathlib
 import subprocess
@@ -240,6 +241,8 @@ int __wrap_posix_memalign(void **, size_t, size_t);
 size_t __wrap_malloc_usable_size(const void *);
 unsigned eden_heap_arenas_created(void);
 unsigned long long eden_heap_arenas_given_back(void);
+unsigned eden_heap_arenas_spare(void);
+unsigned long long eden_heap_arenas_reused(void);
 size_t eden_heap_committed(void);
 size_t eden_heap_large_held(unsigned *blocks);
 void eden_heap_spill_stats(unsigned long long *, unsigned long long *, unsigned long long *, unsigned long long *);
@@ -629,10 +632,10 @@ int main(int argc, char **argv) {
         pthread_t churn[8];
         for (uintptr_t i = 0; i < 8; ++i) assert(pthread_create(&churn[i], NULL, worker, (void *)(i + 11)) == 0);
         for (int i = 0; i < 8; ++i) pthread_join(churn[i], NULL);
-        // Empty arenas given back. A thread that took 200 MiB of small blocks, freed them and ended
-        // kept its arenas so far (EDEN_HEAP_KEEP_ARENAS); without that, all but its first go back to
-        // their spaces as it ends, and a trim gives back the holders' (they are still there, on one
-        // arena each) and what the ended records kept.
+        // Empty arenas spared. A thread that took 200 MiB of small blocks, freed them and ended
+        // kept its arenas so far (EDEN_HEAP_KEEP_ARENAS); without that, all but its first go to the
+        // spares as it ends, a trim moves the holders' (they are still there, on one arena each) and
+        // what the ended records kept, and the next thread takes spares instead of new arenas.
         setenv("EDEN_HEAP_NO_ADOPT", "1", 1);
         pthread_t leaver;
         const unsigned long long back_before = eden_heap_arenas_given_back();
@@ -649,19 +652,33 @@ int main(int argc, char **argv) {
         assert(pthread_create(&leaver, NULL, room_taker, NULL) == 0);
         pthread_join(leaver, NULL);
         const unsigned long long back_at_end = eden_heap_arenas_given_back() - back_before;
-        if (!(back_at_end >= 50 && eden_heap_arenas_created() <= alive_kept + 1)) {
-            fprintf(stderr, "arenas at a thread's end: %u -> %u arenas, %llu given back\n", alive_kept,
-                    eden_heap_arenas_created(), back_at_end);
+        // The arenas stay (no mspace is destroyed): the count of them does not fall, the spares rise.
+        if (!(back_at_end >= 50 && eden_heap_arenas_spare() >= 50)) {
+            fprintf(stderr, "arenas at a thread's end: %u -> %u arenas, %llu given back, %u spare\n", alive_kept,
+                    eden_heap_arenas_created(), back_at_end, eden_heap_arenas_spare());
             abort();
         }
         const size_t pieces_before_trim = eden_heap_committed();
         const size_t trimmed = eden_heap_trim();
         const unsigned long long back_at_trim = eden_heap_arenas_given_back() - back_before - back_at_end;
         // The holders' and the ended records': over 200 of them; what is left is a few a record.
-        if (!(back_at_trim >= 200 && eden_heap_arenas_created() + 200 <= alive_kept &&
+        if (!(back_at_trim >= 200 && eden_heap_arenas_spare() >= 250 &&
               eden_heap_committed() == pieces_before_trim - trimmed)) {
-            fprintf(stderr, "arenas at a trim: %u -> %u arenas, %llu given back, %zu MiB of pieces\n", alive_kept,
-                    eden_heap_arenas_created(), back_at_trim, trimmed >> 20);
+            fprintf(stderr, "arenas at a trim: %u -> %u arenas, %llu given back, %u spare, %zu MiB of pieces\n", alive_kept,
+                    eden_heap_arenas_created(), back_at_trim, eden_heap_arenas_spare(), trimmed >> 20);
+            abort();
+        }
+        // The next thread that needs 100 arenas takes spares: the heap makes none, or nearly none.
+        const unsigned created_before_reuse = eden_heap_arenas_created();
+        const unsigned spare_before_reuse = eden_heap_arenas_spare();
+        const unsigned long long reused_before = eden_heap_arenas_reused();
+        assert(pthread_create(&leaver, NULL, room_taker, NULL) == 0);
+        pthread_join(leaver, NULL);
+        if (!(eden_heap_arenas_created() <= created_before_reuse + 4 && eden_heap_arenas_reused() >= reused_before + 90 &&
+              eden_heap_arenas_spare() >= spare_before_reuse - 110)) {
+            fprintf(stderr, "spares reused: %u -> %u arenas, %u -> %u spare, %llu taken\n", created_before_reuse,
+                    eden_heap_arenas_created(), spare_before_reuse, eden_heap_arenas_spare(),
+                    eden_heap_arenas_reused() - reused_before);
             abort();
         }
         // Trims while eight threads take and free small blocks (their arenas empty and fill), and
@@ -677,9 +694,10 @@ int main(int argc, char **argv) {
         atomic_store(&trimming, 0);
         pthread_join(trim_thread, NULL);
         eden_heap_growth_report();
-        printf("empty arenas: %llu given back as a thread ended, %llu at a trim (%zu MiB of pieces with them), "
-               "%llu while eight threads worked\n", back_at_end, back_at_trim, trimmed >> 20,
-               eden_heap_arenas_given_back() - back_before - back_at_end - back_at_trim);
+        printf("empty arenas: %llu spared as a thread ended, %llu at a trim (%zu MiB of pieces with them), "
+               "%llu while eight threads worked, %llu taken again, %u spare now\n", back_at_end, back_at_trim, trimmed >> 20,
+               eden_heap_arenas_given_back() - back_before - back_at_end - back_at_trim,
+               eden_heap_arenas_reused() - reused_before, eden_heap_arenas_spare());
         atomic_store(&rooms_done, 1);
         for (int i = 0; i < 2; ++i) pthread_join(holders[i], NULL);
     }
@@ -719,5 +737,6 @@ with tempfile.TemporaryDirectory(prefix='eden-heap-') as work:
 print('Heap by pieces: growth on demand, owners by address, requests larger than a piece, the 6 GiB limit, '
       'the 3 GiB whole-heap fallback, threads keeping more than an arena in arenas of their own (used again by '
       'the next threads), empty spaces given back while six threads take and free blocks and taken again in the '
-      'same range, a large block in pieces of memory when the pool has no one piece for it, empty arenas given '
-      'back as threads end and at a trim while eight threads work, and eight threads under the thread sanitizer PASS')
+      'same range, a large block in pieces of memory when the pool has no one piece for it, empty arenas spared '
+      'as threads end and at a trim while eight threads work and taken again by the next thread, and eight '
+      'threads under the thread sanitizer PASS')
