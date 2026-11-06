@@ -1,0 +1,413 @@
+buffer_cache: EDEN_NX2_KEEP_CPU_WRITES=1 stops downloads landing on newer CPU writes
+
+Port of Djihads80/Eglantine fe2cd8be2b (Duck912, cherry-picked from e27fbc6b03, branch
+fix/oot-blackscreen, 2026-11-05). GPL-3.0-or-later, as the core.
+
+The source commit: with asynchronous GPU emulation Ocarina's Z-target reticle jumped back and forth.
+The game writes per-frame emitter constants into double-buffered slots of a buffer the GPU also
+writes. CPU writes into GPU-written memory are only collected; the GPU thread applies them later. Two
+download paths wrote the GPU's older copy over them: the fencing thread's async downloads, and
+WriteMemory downloading the rest of a page while the collected writes were applied one by one.
+Measured there: reticle flips in 0% of frames, was 56-67%.
+
+- Each write of downloaded data to guest memory skips writes collected and not yet applied
+  (GPUDirtyMemoryManager::ForEachPending reads them without consuming them).
+- InvalidateGPUCache hands the writes over as one batch; the Vulkan rasterizer takes them all out of
+  the GPU-written ranges before applying any.
+
+Changed from the source:
+- Behind EDEN_NX2_KEEP_CPU_WRITES=1. Unset, no source of pending writes is set, every Intersects is
+  false and InvalidateGPUCache runs its old loop. What stays is one empty RangeSet per download.
+- Also covers this tree's own download sites: DownloadRangesMemory (0082) and FinishDownloadPieces
+  (the small-buffer path).
+- Gather is left as it is, not refactored, so frizti-v2-05 stacks beside this. nemyu-02's gather
+  still applies its writes one at a time, without the claim.
+- The source's buffer.Mapped() download path is left out: not part of the fix, and Buffer has no
+  Mapped() here.
+
+Locks: ForEachPending takes the manager's guard under buffer_cache.mutex. Gather holds guard only for
+its swap, and frizti-v2-05's lock is a separate mutex. Read, not run.
+
+Runs on the PS5: same core path. Pool memory: a short list per download, freed at once, switch on.
+Cost: one copy of the pending lists per fence pop, switch on.
+
+Co-authored-by: Duck912 <350528965+Duck912@users.noreply.github.com>
+
+diff --git a/src/core/gpu_dirty_memory_manager.h b/src/core/gpu_dirty_memory_manager.h
+index cc8fc176fd..87349ab79a 100644
+--- a/src/core/gpu_dirty_memory_manager.h
++++ b/src/core/gpu_dirty_memory_manager.h
+@@ -74,6 +74,33 @@ public:
+         front_buffer.clear();
+     }
+ 
++    /// Calls `callback` for each write collected and not yet gathered, without consuming them.
++    void ForEachPending(const std::function<void(PAddr, size_t)>& callback) {
++        std::vector<TransformAddress> pending;
++        {
++            std::scoped_lock lk(guard);
++            pending = back_buffer;
++            const TransformAddress t = current.load(std::memory_order_acquire);
++            if (IsValid(t.address)) {
++                pending.push_back(t);
++            }
++        }
++        for (const auto& transform : pending) {
++            size_t offset = 0;
++            u64 mask = transform.mask;
++            while (mask != 0) {
++                const size_t empty_bits = std::countr_zero(mask);
++                offset += empty_bits << align_bits;
++                mask = mask >> empty_bits;
++                const size_t continuous_bits = std::countr_one(mask);
++                callback((static_cast<PAddr>(transform.address) << page_bits) + offset,
++                         continuous_bits << align_bits);
++                mask = continuous_bits < align_size ? (mask >> continuous_bits) : 0;
++                offset += continuous_bits << align_bits;
++            }
++        }
++    }
++
+ private:
+     struct alignas(8) TransformAddress {
+         u32 address;
+diff --git a/src/video_core/buffer_cache/buffer_cache.h b/src/video_core/buffer_cache/buffer_cache.h
+index 0ee10c0e0d..98aad896f9 100644
+--- a/src/video_core/buffer_cache/buffer_cache.h
++++ b/src/video_core/buffer_cache/buffer_cache.h
+@@ -417,11 +417,12 @@ void BufferCache<P>::DownloadRangesMemory(std::span<const std::pair<DAddr, u64>>
+     }
+     runtime.Finish();
+     const u8* const mapped_memory = download_staging.mapped_span.data();
++    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+     for (const Download& download : downloads) {
+         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+-        device_memory.WriteBlockUnsafe(
+-            device_addr, mapped_memory + (download.copy.dst_offset - download_staging.offset),
+-            download.copy.size);
++        WriteDownloadedMemory(cpu_written, device_addr,
++                              mapped_memory + (download.copy.dst_offset - download_staging.offset),
++                              download.copy.size);
+     }
+ }
+ 
+@@ -1064,8 +1065,9 @@ void BufferCache<P>::FinishDownloadPieces() {
+         }
+         runtime.Finish();
+         const u8* const mapped = runtime.ReservedDownloadBuffer().mapped_span.data();
++        const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+         for (const DownloadPiece& piece : download_pieces) {
+-            device_memory.WriteBlockUnsafe(piece.device_addr, mapped + piece.offset, piece.size);
++            WriteDownloadedMemory(cpu_written, piece.device_addr, mapped + piece.offset, piece.size);
+             // Older downloads of these bytes must not land over them when their fences pop.
+             ClearDownload(piece.device_addr, piece.size);
+             gpu_modified_ranges.Subtract(piece.device_addr, piece.size);
+@@ -1085,6 +1087,43 @@ void BufferCache<P>::PopAsyncFlushes() {
+     PopAsyncBuffers();
+ }
+ 
++template <class P>
++void BufferCache<P>::ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges) {
++    for (const auto& [device_addr, size] : ranges) {
++        if (IsRegionGpuModified(device_addr, size)) {
++            ClearDownload(device_addr, size);
++            gpu_modified_ranges.Subtract(device_addr, size);
++        }
++    }
++}
++
++template <class P>
++Common::RangeSet<DAddr> BufferCache<P>::PendingCpuWriteRanges() {
++    Common::RangeSet<DAddr> ranges;
++    if (pending_cpu_writes) {
++        pending_cpu_writes(
++            [&ranges](DAddr device_addr, size_t size) { ranges.Add(device_addr, size); });
++    }
++    return ranges;
++}
++
++template <class P>
++void BufferCache<P>::WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written,
++                                           DAddr device_addr, const u8* data, u64 size) {
++    if (!cpu_written.Intersects(device_addr, size)) {
++        device_memory.WriteBlockUnsafe(device_addr, data, size);
++        return;
++    }
++    Common::RangeSet<DAddr> parts;
++    parts.Add(device_addr, size);
++    cpu_written.ForEachInRange(device_addr, size, [&parts](DAddr start, DAddr end) {
++        parts.Subtract(start, end - start);
++    });
++    parts.ForEach([&](DAddr start, DAddr end) {
++        device_memory.WriteBlockUnsafe(start, data + (start - device_addr), end - start);
++    });
++}
++
+ template <class P>
+ void BufferCache<P>::PopAsyncBuffers() {
+     if (async_buffers.empty()) {
+@@ -1099,6 +1138,9 @@ void BufferCache<P>::PopAsyncBuffers() {
+     auto& async_buffer = async_buffers.front();
+     u8* base = async_buffer->mapped_span.data();
+     const size_t base_offset = async_buffer->offset;
++    // This runs on the fencing thread while the CPU keeps writing: CPU writes collected since the
++    // copy was taken are newer than it, and the GPU thread hasn't dropped them from `ranges` yet.
++    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+     for (const auto& copy : downloads) {
+         const DAddr device_addr = static_cast<DAddr>(copy.src_offset);
+         const u64 dst_offset = copy.dst_offset - base_offset;
+@@ -1106,8 +1148,8 @@ void BufferCache<P>::PopAsyncBuffers() {
+         // Only what no write replaced since the copy was taken: the rest is older than guest
+         // memory (CPU writes) or than the GPU's copy (GPU writes, still to be downloaded).
+         ranges.ForEachInRange(device_addr, copy.size, [&](DAddr start, DAddr end) {
+-            device_memory.WriteBlockUnsafe(start, &read_mapped_memory[start - device_addr],
+-                                           end - start);
++            WriteDownloadedMemory(cpu_written, start, &read_mapped_memory[start - device_addr],
++                                  end - start);
+             gpu_modified_ranges.Subtract(start, end - start);
+         });
+     }
+@@ -2933,11 +2975,12 @@ void BufferCache<P>::DownloadBuffersMemory(std::span<const BufferId> buffer_ids)
+     }
+     runtime.Finish();
+     const u8* const mapped_memory = download_staging.mapped_span.data();
++    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+     for (const Download& download : downloads) {
+         const DAddr device_addr = slot_buffers[download.buffer_id].CpuAddr() + download.copy.src_offset;
+-        device_memory.WriteBlockUnsafe(
+-            device_addr, mapped_memory + (download.copy.dst_offset - download_staging.offset),
+-            download.copy.size);
++        WriteDownloadedMemory(cpu_written, device_addr,
++                              mapped_memory + (download.copy.dst_offset - download_staging.offset),
++                              download.copy.size);
+     }
+ }
+ 
+@@ -2971,6 +3014,7 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
+     if (total_size_bytes == 0) {
+         return;
+     }
++    const Common::RangeSet<DAddr> cpu_written = PendingCpuWriteRanges();
+ 
+     if constexpr (USE_MEMORY_MAPS) {
+         std::optional<Async_Buffer> staged;
+@@ -3001,14 +3045,14 @@ void BufferCache<P>::DownloadBufferMemory(Buffer& buffer, DAddr device_addr, u64
+             // Undo the modified offset
+             const u64 dst_offset = copy.dst_offset - download_staging.offset;
+             const u8* copy_mapped_memory = mapped_memory + dst_offset;
+-            device_memory.WriteBlockUnsafe(copy_device_addr, copy_mapped_memory, copy.size);
++            WriteDownloadedMemory(cpu_written, copy_device_addr, copy_mapped_memory, copy.size);
+         }
+     } else {
+         const std::span<u8> immediate_buffer = ImmediateBuffer(largest_copy);
+         for (const BufferCopy& copy : copies) {
+             buffer.ImmediateDownload(copy.src_offset, immediate_buffer.subspan(0, copy.size));
+             const DAddr copy_device_addr = buffer.CpuAddr() + copy.src_offset;
+-            device_memory.WriteBlockUnsafe(copy_device_addr, immediate_buffer.data(), copy.size);
++            WriteDownloadedMemory(cpu_written, copy_device_addr, immediate_buffer.data(), copy.size);
+         }
+     }
+ }
+diff --git a/src/video_core/buffer_cache/buffer_cache_base.h b/src/video_core/buffer_cache/buffer_cache_base.h
+index 54b9495e2c..57e3666108 100644
+--- a/src/video_core/buffer_cache/buffer_cache_base.h
++++ b/src/video_core/buffer_cache/buffer_cache_base.h
+@@ -267,6 +267,13 @@ public:
+     /// Cancels pending downloads over the range, so a fence can't write them over newer bytes.
+     void ClearDownload(DAddr base_addr, u64 size);
+ 
++    /// CPU writes collected but not yet applied (SetPendingCpuWrites).
++    [[nodiscard]] Common::RangeSet<DAddr> PendingCpuWriteRanges();
++
++    /// Writes downloaded bytes to guest memory, except over `cpu_written`.
++    void WriteDownloadedMemory(const Common::RangeSet<DAddr>& cpu_written, DAddr device_addr,
++                               const u8* data, u64 size);
++
+     bool OnCPUWrite(DAddr device_addr, u64 size);
+ 
+     void DownloadMemory(DAddr device_addr, u64 size);
+@@ -335,6 +342,19 @@ public:
+                                                           ObtainBufferOperation post_op);
+     void FlushCachedWrites();
+ 
++    /// Where the CPU writes into GPU-written memory that were collected but not applied yet
++    /// (WriteMemory) come from: downloads must not write the GPU's older copy over them. Unset,
++    /// downloads write everything (EDEN_NX2_KEEP_CPU_WRITES off).
++    using PendingCpuWrites = std::function<void(const std::function<void(DAddr, size_t)>&)>;
++    void SetPendingCpuWrites(PendingCpuWrites source) {
++        pending_cpu_writes = std::move(source);
++    }
++
++    /// Takes CPU writes about to be applied one by one out of the GPU-written ranges first, so
++    /// applying one doesn't download the GPU's copy over another (WriteMemory keeps the GPU data
++    /// on the pages it writes).
++    void ClaimCpuWrites(std::span<const std::pair<DAddr, u64>> ranges);
++
+     /// Return true when there are uncommitted buffers to be downloaded
+     [[nodiscard]] bool HasUncommittedFlushes() const noexcept;
+ 
+@@ -776,6 +796,7 @@ private:
+     /// fence pops. A write to a range after a download was taken removes it from that download
+     /// (and every other pending one): its bytes are older than the write.
+     std::deque<Common::RangeSet<DAddr>> pending_download_ranges;
++    PendingCpuWrites pending_cpu_writes;
+     std::optional<Async_Buffer> current_buffer;
+ 
+     std::deque<Async_Buffer> async_buffers_death_ring;
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index c18016b7e6..ad0413acdf 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -23,6 +23,7 @@
+ #include "core/core_timing.h"
+ #include "core/frontend/emu_window.h"
+ #include "core/frontend/graphics_context.h"
++#include "core/gpu_dirty_memory_manager.h"
+ #include "core/hle/service/nvdrv/nvdata.h"
+ #include "core/perf_stats.h"
+ #include "video_core/cdma_pusher.h"
+@@ -130,6 +131,16 @@ struct GPU::Impl {
+ 
+     /// Synchronizes CPU writes with Host GPU memory.
+     void InvalidateGPUCache() {
++        if (VideoCore::KeepCpuWrites()) {
++            std::vector<std::pair<DAddr, u64>> writes;
++            std::function<void(PAddr, size_t)> collect_writes(
++                [&writes](PAddr address, size_t size) { writes.emplace_back(address, size); });
++            system.GatherGPUDirtyMemory(collect_writes);
++            if (!writes.empty()) {
++                renderer->ReadRasterizer()->OnCacheInvalidations(writes);
++            }
++            return;
++        }
+         std::function<void(PAddr, size_t)> callback_writes([this](PAddr address, size_t size) {
+             renderer->ReadRasterizer()->OnCacheInvalidation(address, size);
+         });
+@@ -238,6 +249,12 @@ struct GPU::Impl {
+         gpu_thread.SubmitList(channel, std::move(entries), is_async);
+     }
+ 
++    void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
++        for (auto& manager : system.GetGPUDirtyMemoryManager()) {
++            manager.ForEachPending(callback);
++        }
++    }
++
+     void RunInOrder(std::function<void()>&& func) {
+         gpu_thread.Run(std::move(func), is_async);
+     }
+@@ -623,6 +640,10 @@ void GPU::FlushRegion(DAddr addr, u64 size) {
+     impl->FlushRegion(addr, size);
+ }
+ 
++void GPU::ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback) {
++    impl->ForEachPendingCpuWrite(callback);
++}
++
+ void GPU::RunInOrder(std::function<void()>&& func) {
+     impl->RunInOrder(std::move(func));
+ }
+diff --git a/src/video_core/gpu.h b/src/video_core/gpu.h
+index 05c9e13487..d3cf4689ef 100644
+--- a/src/video_core/gpu.h
++++ b/src/video_core/gpu.h
+@@ -257,6 +257,10 @@ public:
+     /// Runs func on the GPU thread after the command lists submitted so far.
+     void RunInOrder(std::function<void()>&& func);
+ 
++    /// Calls `callback` for each CPU write into GPU-written memory that InvalidateGPUCache has not
++    /// applied yet.
++    void ForEachPendingCpuWrite(const std::function<void(DAddr, size_t)>& callback);
++
+     /// RunInOrder for GPU memory maps: also done before the GPU thread reads the command lists
+     /// submitted later (with the GPU split, on its front rather than its back).
+     /// [gpu_addr, gpu_addr + size) is the range of GPU addresses the map changes.
+diff --git a/src/video_core/rasterizer_interface.h b/src/video_core/rasterizer_interface.h
+index 829561f34b..b8efd3dfa4 100644
+--- a/src/video_core/rasterizer_interface.h
++++ b/src/video_core/rasterizer_interface.h
+@@ -7,6 +7,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <cstdlib>
+ #include <functional>
+ #include <optional>
+ #include <span>
+@@ -36,6 +37,16 @@ struct TICEntry;
+ 
+ namespace VideoCore {
+ 
++/// EDEN_NX2_KEEP_CPU_WRITES=1: downloads skip CPU writes collected and not applied yet, and those
++/// writes reach the rasterizer as one batch. A function-local static: env.txt is read in main.
++[[nodiscard]] inline bool KeepCpuWrites() {
++    static const bool keep = [] {
++        const char* const value = std::getenv("EDEN_NX2_KEEP_CPU_WRITES");
++        return value != nullptr && value[0] == '1';
++    }();
++    return keep;
++}
++
+ enum class LoadCallbackStage {
+     Prepare,
+     Build,
+@@ -137,6 +148,13 @@ public:
+     /// Notify rasterizer that any caches of the specified region are desync with guest
+     virtual void OnCacheInvalidation(PAddr addr, u64 size) = 0;
+ 
++    /// OnCacheInvalidation for each of the CPU writes InvalidateGPUCache collected.
++    virtual void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
++        for (const auto& [addr, size] : ranges) {
++            OnCacheInvalidation(addr, size);
++        }
++    }
++
+     virtual bool TryCacheInvalidation(DAddr addr, u64 size) {
+         if (MustFlushRegion(addr, size, VideoCommon::CacheType::BufferCache)) return false;
+         OnCacheInvalidation(addr, size);
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 58cd149b26..ea98189825 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -240,6 +240,12 @@ RasterizerVulkan::RasterizerVulkan(Core::Frontend::EmuWindow& emu_window_, Tegra
+       fence_manager(*this, gpu, texture_cache, buffer_cache, query_cache, device, scheduler),
+       wfi_event(device.GetLogical().CreateEvent()) {
+     scheduler.SetQueryCache(query_cache);
++    if (VideoCore::KeepCpuWrites()) {
++        buffer_cache.SetPendingCpuWrites(
++            [this](const std::function<void(DAddr, size_t)>& callback) {
++                gpu.ForEachPendingCpuWrite(callback);
++            });
++    }
+     buffer_cache_runtime.SetReleaseHook(
+         [](void* context) { static_cast<RasterizerVulkan*>(context)->ReleaseFinishedMemory(); },
+         this);
+@@ -1396,6 +1402,16 @@ void RasterizerVulkan::OnCacheInvalidation(DAddr addr, u64 size) {
+     pipeline_cache.InvalidateRegion(addr, size);
+ }
+ 
++void RasterizerVulkan::OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) {
++    {
++        std::scoped_lock lock{buffer_cache.mutex};
++        buffer_cache.ClaimCpuWrites(ranges);
++    }
++    for (const auto& [addr, size] : ranges) {
++        OnCacheInvalidation(addr, size);
++    }
++}
++
+ bool RasterizerVulkan::TryCacheInvalidation(DAddr addr, u64 size) {
+     if (addr == 0 || size == 0) return true;
+     {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 1762488e84..5f865ceb79 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -109,6 +109,7 @@ public:
+     void PrepareRegionWrite(DAddr addr, u64 size, VideoCommon::CacheType which) override;
+     void InnerInvalidation(std::span<const std::pair<DAddr, std::size_t>> sequences) override;
+     void OnCacheInvalidation(DAddr addr, u64 size) override;
++    void OnCacheInvalidations(std::span<const std::pair<DAddr, u64>> ranges) override;
+     bool TryCacheInvalidation(DAddr addr, u64 size) override;
+     bool OnCPUWrite(DAddr addr, u64 size) override;
+     void InvalidateGPUCache() override;
