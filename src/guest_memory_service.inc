@@ -29,8 +29,11 @@
 namespace {
 enum : std::uint8_t { SlotZero = 0, SlotOwn = 1, SlotShared = 2, SlotFine = 3, SlotProbe = 4, SlotOut = 5, SlotLock = 0x80, SlotMask = 0x7f };
 constexpr std::size_t FinePage = 16384, FinePages = SparseSlot / FinePage;
-// A written slot becomes Fine with at least this many pages of zeroes (512 KiB given back).
-constexpr std::size_t FineMinZeroPages = 32;
+// A written slot becomes Fine with at least this many pages of zeroes (32: 512 KiB given back).
+// EDEN_CRAM_FINE_MIN_PAGES=<1 to 127> changes it (off unless asked for). EDEN_CRAM_ZEROS says what a
+// lower number would give back. The price: a write to a Fine slot wants a whole 2 MiB block at once,
+// so more Fine slots means more blocks wanted just when the pool is short.
+std::size_t fine_min_zero_pages = 32;
 // A slot made whole again by a write waits 1, 2, 4 ... 1024 scan passes before it may be Fine again.
 constexpr unsigned FineBackoffMax = 10;
 
@@ -1275,7 +1278,7 @@ bool ScanZero(SparseRange& range, std::size_t slot) noexcept {
 }
 
 // Own slots by the 16 KiB pages of zeroes they hold, for the report (EDEN_CRAM_ZEROS): place 0 none,
-// then 1, 2-3, 4-7 ... 64-127. What a lower FineMinZeroPages could give back, and what the slots that
+// then 1, 2-3, 4-7 ... 64-127. What a lower EDEN_CRAM_FINE_MIN_PAGES could give back, and what the slots that
 // wait out a backoff hold. Written by the scanner only; the counts of the last whole pass are kept.
 constexpr std::size_t ZeroPlaces = 8;
 struct ZeroCounts {
@@ -1309,7 +1312,7 @@ bool ScanFine(SparseRange& range, std::size_t slot) noexcept {
     for (std::size_t page = 0; page < FinePages; ++page) zeros += PageZero(at + page * FinePage);
     const bool waiting = counters.passes.load(std::memory_order_relaxed) < range.fine_after[slot];
     NoteZeroPages(zeros, waiting);
-    if (waiting || zeros < FineMinZeroPages) return false;
+    if (waiting || zeros < fine_min_zero_pages) return false;
     LockSlot(range, slot);
     if (SlotState(range, slot) != SlotOwn) {
         UnlockSlot(range, slot, SlotState(range, slot));
@@ -1326,7 +1329,7 @@ bool ScanFine(SparseRange& range, std::size_t slot) noexcept {
         counters.returns_scan.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
-    if (zeros >= FineMinZeroPages) {
+    if (zeros >= fine_min_zero_pages) {
         fined = MakeFine(range, slot, zero, FinePages - zeros);
         if (!fined) counters.fine_failures.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1777,6 +1780,10 @@ void ServiceStart(SparseRange& range) noexcept {
     }
     ResetCounters();
     range.promote = true;
+    if (const char* pages = std::getenv("EDEN_CRAM_FINE_MIN_PAGES")) {
+        const unsigned long asked = std::strtoul(pages, nullptr, 10);
+        if (asked >= 1 && asked < FinePages) fine_min_zero_pages = asked;
+    }
 #ifdef PS5_NATIVE
     if (const char* floor = std::getenv("EDEN_GUEST_RESERVE_FLOOR"))
         reserve_floor.store(std::min<std::size_t>(std::strtoul(floor, nullptr, 10), ReserveBlocks),
@@ -1806,10 +1813,10 @@ void ServiceStart(SparseRange& range) noexcept {
     }
 #endif
     char line[128];
-    const int length = std::snprintf(line, sizeof(line), "EDEN_CRAM on: scan=%d dedup=%d fine=%d reserve=%zuMiB\n",
+    const int length = std::snprintf(line, sizeof(line), "EDEN_CRAM on: scan=%d dedup=%d fine=%d reserve=%zuMiB fine_min=%zu\n",
                                      scan_requested.load() ? 1 : 0, dedup_requested.load() ? 1 : 0,
                                      fine_requested.load() ? 1 : 0,
-                                     reserve_count.load() * (SparseSlot >> 20));
+                                     reserve_count.load() * (SparseSlot >> 20), fine_min_zero_pages);
     if (length > 0) Report(line);
 }
 
