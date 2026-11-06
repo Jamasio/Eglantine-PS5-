@@ -778,6 +778,23 @@ int main(int argc, char** argv) {
         const uint64_t game_title = 0;
 #endif
         Eden::session_title.store(game_title);
+        if (game_title) {
+            // env-<title id>.txt in the app folder (env-0400c3f00006e000.txt): env.txt's lines for
+            // this game alone, read now that the game is known and before the core reads its
+            // switches. A later line wins over env.txt. No file, no change. Mario Kart World can
+            // then have its texture trims without another game getting them. The core keeps a
+            // switch's first value for the life of the process, so leave the app between games.
+            char title_environment[40];
+            std::snprintf(title_environment, sizeof(title_environment), "env-%016llx.txt",
+                          static_cast<unsigned long long>(game_title));
+            std::ifstream environment(Eden::AppFile(title_environment));
+            for (std::string entry; std::getline(environment, entry);) {
+                const auto split = entry.find('=');
+                if (entry.empty() || entry[0] == '#' || split == std::string::npos || split == 0) continue;
+                setenv(entry.substr(0, split).c_str(), entry.c_str() + split + 1, 1);
+                std::printf("EDEN_ENV_TITLE %s\n", entry.c_str());
+            }
+        }
         const unsigned cycles = game ? 1 : 3;
         const bool devices = EDEN_DEVICE_FRONTEND;
         if (game) {
