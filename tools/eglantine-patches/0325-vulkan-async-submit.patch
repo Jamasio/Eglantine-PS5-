@@ -231,7 +231,7 @@ waits therefore remain unbounded without observing an unsubmitted tick.
 +                              signal_value]() mutable {
 +            static const s64 submit_watch_ms = [] {
 +                const char* const value = std::getenv("EDEN_NX2_ASYNC_SUBMIT_WATCH_MS");
-+                return value != nullptr ? (std::max)(s64{0}, std::atoll(value)) : s64{0};
++                return value != nullptr ? std::max<s64>(s64{0}, static_cast<s64>(std::atoll(value))) : s64{0};
 +            }();
 +            const auto submit_start = std::chrono::steady_clock::now();
 +            const VkResult result = master_semaphore->SubmitQueue(
