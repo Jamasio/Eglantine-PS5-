@@ -10,12 +10,78 @@
 </p>
 
 <p align="center">
-  <a href="#english">English</a> · <a href="#español">Español</a> · <a href="../../releases">Releases / Descargas</a>
+  <a href="#english">English</a> · <a href="#español">Español</a> · <a href="https://github.com/Vampinity/Eglantine-PS5-/releases">Releases / Descargas</a>
 </p>
 
 > [!WARNING]
 > Unofficial, experimental software. It is not affiliated with Sony, Nintendo, the Eglantine team or the Eden team. It contains **no** games, keys or firmware: you must bring your own legally dumped files.
 > Software no oficial y experimental. Sin relación con Sony, Nintendo ni los equipos de Eglantine o Eden. **No** incluye juegos, claves ni firmware: tienes que aportar los tuyos, volcados legalmente.
+
+## This branch: Ocarina of Time (Switch 2) test build 1
+
+<p align="center">
+  <img src="docs/images/t49-hero.jpg" width="100%" alt="Link running past ferns and a stream in the forest, with the tree leaves back">
+</p>
+<table>
+  <tr>
+    <td width="33%"><img src="docs/images/t45-tree.jpg" alt="The Great Deku Tree"></td>
+    <td width="33%"><img src="docs/images/t45-water.jpg" alt="Water with a reflection, inside the dungeon"></td>
+    <td width="33%"><img src="docs/images/t45-dungeon.jpg" alt="Burning a web with a lit stick"></td>
+  </tr>
+</table>
+<p align="center"><sub>Captured from my PS5. The big picture is T49 with leaves on. The small ones are from the T45 run with leaves off, which is why the Deku Tree has bare branches. The top left corner is the app's own counter: F is frames per second, S is speed in percent, and W, which looks like an M here, is the slowest recent frame in milliseconds.</sub></p>
+
+This branch adds patches to viejunerd's EglantinePS5 v1.219.020 for The Legend of Zelda: Ocarina of Time (Switch 2) on a jailbroken PS5. One run got through the first dungeon, and the tree leaves are back as an option. It is emulation, and it is a rough test build (my build T49), not a release of the main project.
+
+**[Download](https://github.com/Vampinity/Eglantine-PS5-/releases)** · **[Install steps](RELEASE-NOTES.md)** · **[What this branch adds](docs/ocarina-test-1-changes.md)**
+
+| Item | Result |
+|---|---|
+| **What it is** | Emulation of The Legend of Zelda: Ocarina of Time (Switch 2), version 1.1.1, on a jailbroken PS5 |
+| **Tested on** | One base PS5, firmware 12.40, by one person |
+| **Modes** | Faster: leaves off, the default. Prettier: leaves and plants on, plus a second flash setting. One build, two env files |
+| **Best run** | T45, leaves off: from a Kokiri Forest save through the first dungeon and its boss, 33.7 minutes without a freeze |
+| **How it ended** | The app ran out of memory after the warp cutscene |
+| **Leaves on** | T47 to T49: warm launches ran 7 to 21 minutes so far, before the flash settings went in. In the 21 minute one, Link stood still for the second half |
+| **Speed** | T45, leaves off: about 27 fps median on the app's counter, 22 to 32 for most of the run. T47 to T49, leaves on: about 18 to 24 fps. One Faster stretch on T49 read 18.7 fps, and I don't understand that yet |
+| **Flashes** | White flashes are much reduced in the T49 runs I scanned, not proven gone. Dark one-frame glitches remain |
+| **Still to check** | A cold launch on T49 with no shader cache, and why Faster read 18.7 fps. Faster has only had about 4 minutes on T49 |
+| **Not tested** | Anything past the first dungeon |
+| **Other games** | Not tested on this build |
+
+<details>
+<summary>Progress by build</summary>
+
+<img src="docs/images/progress.jpg" width="100%" alt="Six captures from T8 to T47: hazy, white fog, fog fixed, grass back, water reflection, leaves back">
+
+</details>
+
+### What works
+
+- Leaves off, in that one T45 run: Kokiri Forest, the walk to the Deku Tree, and the first dungeon up to the end of the boss fight.
+- Water reflections, outdoor mist, grass, moss, house walls and doors.
+- Leaves on, T47 to T49: tree leaves, ferns and ground plants are back. With them back, the sky and fog match the Switch 2 footage I compared. The white sky in my OBS recordings comes from a contrast curve in the capture.
+
+### What doesn't work yet
+
+- **First launch.** With leaves on, a first launch can run out of memory. T47 stopped at 468 s and T48 at 125 s, with the heap above 3,000 MiB against a peak of 1,600 to 1,900 on a warm launch. T49 limits the shader builders to 4 and adds exploitizm's compile fix, but my T49 runs were warm, so a cold launch on T49 with no shader cache hasn't been tested. The 4 builders may also make the title screen and intro slower. Launch twice.
+- **Memory.** Running out ended three of the four hand runs on T45, after 4, 16 and 34 minutes. The two longest ended just after an area change. Save often.
+- **Sudden exit.** The other T45 run, with the same `env.txt` as the best run, closed by itself after 6 minutes during the Deku Tree cutscene, with no crash report. The cause isn't known.
+- **Dark glitches.** Dark one-frame glitches on sunlit ground, worst in open areas. The cause is unknown. They often come at the same moment as a brief change in the water, and they don't depend on occlusion reports or table mode.
+- **White flashes.** Much reduced in the runs I scanned, not proven gone. Those runs were short and all in Docked. The numbers are in the [release notes](RELEASE-NOTES.md).
+- **Stalls.** The picture can stop for up to 2.6 seconds. The long T45 run had at least nine stops of over a second.
+- **Plants.** Faster has no tree leaves, ferns, flowers or leafy bushes. Prettier has them, but one mesh pipeline is still dropped, so not every shrub shows.
+- **Water edges.** Land under the water at the edge can glitch dark in places.
+
+### How this was made
+
+I'm not a programmer. Nearly all of the new code in this branch was written by Claude, Anthropic's AI, and OpenAI's Codex helped move the patches to v1.219.020. My part was playing, reporting what I saw and deciding what to try next. Most patch headers say where the change comes from.
+
+### Who looks after it
+
+Nobody, for the long term. I did this so people could play sooner, and I'll step away once the real maintainers take it further. Reports go to [viejunerd's issue 21](https://github.com/viejunerd/Eglantine-PS5-/issues/21). If something here is useful, take it upstream.
+
+Most of this is other people's work: see [the credits for this branch](#credits-for-this-branch).
 
 ---
 
@@ -54,7 +120,7 @@ On the console, the Vulkan driver hung a Switch 2 game when it started from the 
 
 ## Install
 
-1. Download the release ZIP from **[Releases](../../releases)** and extract it. It contains one folder, `PPSA98515`.
+1. Download the release ZIP from **[Releases](https://github.com/Vampinity/Eglantine-PS5-/releases)** and extract it. It contains one folder, `PPSA98515`.
 2. Copy that folder to `/data/homebrew/PPSA98515` on the PS5 (or another folder ShadowMountPlus scans, e.g. `/mnt/usb0/homebrew/PPSA98515`). Use [ShadowMountPlus 1.7beta4](https://github.com/drakmor/ShadowMountPlus/releases/tag/1.7beta4) or newer.
 3. Put your own **keys, firmware and games** in a *game files folder* (layout and options: [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md#install)). Games go in `roms/`: `.nsp`, `.xci`, **`.nup`**, or an extracted folder.
 4. Start **EglantinePS5** from the PS5 home screen.
@@ -172,6 +238,25 @@ GPL-3.0-or-later (see [LICENSE](LICENSE) and [THIRD_PARTY_NOTICES.md](THIRD_PART
 
 Thanks to: **Djihads80 and the Eglantine contributors**; the **Eden** and yuzu projects; **heydemoura** (EglantinePS5 frontend and PS5 port work); **BlackBearReloaded** (ProsperoEden, ps5-opengl, PS5 native app boilerplate); **Mihawk** (PS5 Mesa/RADV and PS5 Vulkan); **mpereiraesaa** (ps5-vulkan); **drakmor** (ShadowMountPlus). The detailed credit list is in [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md).
 
+### Credits for this branch
+
+Most patch headers and code comments say who did what, with commits and PR numbers.
+
+- **EglantinePS5:** viejunerd and heydemoura.
+- **Eglantine:** Djihads80 and the contributors, among them kraibse, Duck912, rdenno and nowhere02.
+- **Lichii:** zortos293 and the contributors, among them mja00, Frizti, Dr. Sergio, ogeidexe, WeslieDE, celmax85, jpkto, vouion, thibaut, tibzejoker, Inc0rporate, ProphetWild, 999sian, Kajcsi, A-Man-With-A-Plan-dev, Mattscreative, chuppatricky, pavelgajdo and felipecsl.
+- **exploitizm:** mesh shaders as compute in the driver, the compile fix, and the leaf fix. He published the leaf fix minutes before my build got there separately, from a count of dropped draws.
+- **Kajcsi:** the occlusion pause, [Lichii PR 121](https://github.com/zortos293/Lichii/pull/121). The switch around it was added here.
+- **Inc0rporate:** keeping reports pending until their fence, [Lichii PR 337](https://github.com/zortos293/Lichii/pull/337). The switch around it was added here.
+- **Oliv3rmoon:** the driver's stall report.
+- **Aflakon:** proved cold memory first, with a 36 minute session.
+- **Frizti and EvilOOT:** the fence setting that reduces flashes, left out of this build's env files.
+- **Dark (Eglantine Dev):** Dynamic FPS for Ocarina, by way of Frizti's Lichii.
+- **Duck912:** paired pointers, and other fixes.
+- **Shakoquo / sharkiix:** the blend, sampler and depth fixes.
+- **Code also came from:** MythosOfs (Orchid), Rockiu0 and Swordpdf (ProsperoEden), sylvieistaken (selevet-eglantine), notquiteog (Elysium), boykopovar (AnyPS5), Franseven (PokeDinner) and mihawk-99 (PS5 Mesa).
+- **Eden and yuzu:** the emulators all of this is built on.
+
 ---
 
 # Español
@@ -213,7 +298,7 @@ En la consola, el driver de Vulkan colgaba un juego de Switch 2 cuando arrancaba
 
 ## Instalación
 
-1. Descarga el ZIP desde **[Releases](../../releases)** y descomprímelo. Contiene una carpeta, `PPSA98515`.
+1. Descarga el ZIP desde **[Releases](https://github.com/Vampinity/Eglantine-PS5-/releases)** y descomprímelo. Contiene una carpeta, `PPSA98515`.
 2. Copia esa carpeta a `/data/homebrew/PPSA98515` en la PS5 (o a otra carpeta que escanee ShadowMountPlus, p. ej. `/mnt/usb0/homebrew/PPSA98515`). Usa [ShadowMountPlus 1.7beta4](https://github.com/drakmor/ShadowMountPlus/releases/tag/1.7beta4) o posterior.
 3. Pon tus **claves, firmware y juegos** en una *carpeta de archivos de juego* (estructura y opciones: [docs/UPSTREAM_README.md](docs/UPSTREAM_README.md#install), en inglés). Los juegos van en `roms/`: `.nsp`, `.xci`, **`.nup`** o una carpeta extraída.
 4. Abre **EglantinePS5** desde la pantalla de inicio de la PS5.
