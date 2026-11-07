@@ -594,12 +594,34 @@ int main(int argc, char** argv) {
         setenv("EDEN_NX2_LIST_CPU_SYNC", "1", 0);
         // Native channels never consume their inline-upload bookkeeping list; do not grow it.
         setenv("EDEN_NX2_NO_UPLOAD_STORE", "1", 0);
+        // Safe PS5 defaults for the native RADV path. env.txt is loaded above, so =0/1 there
+        // remains an explicit per-title override. The mapped readback path is the production form;
+        // its probe is diagnostic-only and stays off unless a diagnostic build forces it.
+        setenv("EDEN_PS5_LAZY_PRESENT", "1", 0);
+        setenv("EDEN_PS5_UNWRITTEN_READS", "1", 0);
+        setenv("EDEN_PS5_MAPPED_READBACK", "1", 0);
+        setenv("EDEN_PS5_READBACK_PRODUCERS", "1", 0);
+        setenv("EDEN_PS5_MAPPED_READBACK_PROBE", "0", 0);
+#endif
+#ifdef PS5_NATIVE
+        // Smaller dispatch tables save committed heap without changing the fallback path.
+        setenv("EDEN_JIT_DISPATCH_BITS", "18", 0);
+        // Workers reached the old 96 MiB cache; 128 MiB avoids repeated whole-cache evictions.
+        setenv("EDEN_JIT_CACHE_MIB", "160,144,128", 0);
 #endif
         if (const char* const reuse = std::getenv("EDEN_JIT_PAGE_REUSE"); reuse && reuse[0] == '1')
             eden_page_reuse = true;
         // JIT code generation, read before the first block compiles. EDEN_JIT_CODEGEN=1 turns all
         // six on; a switch of its own wins, so EDEN_JIT_R13=0 takes one out of the set.
         {
+#ifdef PS5_NATIVE
+            // Safe code-shape defaults. Set each member rather than the group so the ordering
+            // experiments stay off and each optimization can be bisected independently.
+            setenv("EDEN_JIT_FREE_MOVES", "1", 0);
+            setenv("EDEN_JIT_R13", "1", 0);
+            setenv("EDEN_JIT_FCMP_ADC", "1", 0);
+            setenv("EDEN_JIT_CHECKBIT_FLAGS", "1", 0);
+#endif
             const char* const all = std::getenv("EDEN_JIT_CODEGEN");
             const auto chosen = [all](const char* name) {
                 const char* const own = std::getenv(name);
@@ -616,6 +638,43 @@ int main(int argc, char** argv) {
                         eden_plain_ordered_reads, eden_fcmp_adc, eden_light_dmb, eden_checkbit_flags,
                         eden_page_reuse);
         }
+#ifdef PS5_NATIVE
+        // Safe PS5-native fixes and measured fast paths. Every entry is a default only: env.txt
+        // still wins because these setenv calls do not overwrite an explicit value.
+        for (const auto& [name, value] : {
+            std::pair{"EDEN_AREA_CHANGE_SCRATCH_RELEASE", "1"},
+            std::pair{"EDEN_NX2_AMD_PR273", "1"},
+            std::pair{"EDEN_NX2_AMD_SHADER_FIXES", "1"},
+            std::pair{"EDEN_NX2_CAS_RETURNED", "1"},
+            std::pair{"EDEN_NX2_IADD32_OVERFLOW", "1"},
+            std::pair{"EDEN_NX2_PAIRED_POINTERS", "1"},
+            std::pair{"EDEN_NX2_MASK_UNWRITTEN", "1"},
+            std::pair{"EDEN_NX2_INVALIDATION_FILTER", "1"},
+            std::pair{"EDEN_NX2_SHADER_FAST_SCAN", "1"},
+            std::pair{"EDEN_NX2_PIPELINE_CLEAN", "1"},
+            std::pair{"EDEN_NX2_QUERY_WAIT_ONCE", "1"},
+            std::pair{"EDEN_NX2_RUNTIME_PTP", "1"},
+            std::pair{"EDEN_NX2_CLEAR_BEFORE_COPY", "1"},
+            std::pair{"EDEN_NX2_CLEAR_UPLOAD_GUARDS", "1"},
+            std::pair{"EDEN_NX2_SKIP_OVERWRITTEN_UPLOADS", "1"},
+            std::pair{"EDEN_NX2_TRANSCODE_WAIT", "1"},
+            std::pair{"EDEN_NX2_BUFFER_DOWNLOADS", "0"},
+            std::pair{"EDEN_NX2_NATIVE_GRAPHICS_SIZE", "1"},
+            std::pair{"EDEN_NX2_TABLE_POOL_MIB", "64"},
+            std::pair{"EDEN_NX2_TIGHT_DESCRIPTOR_TABLES", "1"},
+            std::pair{"EDEN_NX2_SSBO_WRITES_SIZED", "1"},
+            std::pair{"EDEN_NX2_UBO_INPLACE", "1"},
+            std::pair{"EDEN_NX2_UBO_BANK_DIRECT", "1"},
+            std::pair{"EDEN_NX2_TABLES_SPEED", "1"},
+            std::pair{"EDEN_NX2_COMPUTE_SAME", "1"},
+            std::pair{"EDEN_NX2_MACRO_SINK", "1"},
+            std::pair{"EDEN_NX2_FETCH_RECHECK", "1"},
+            std::pair{"EDEN_NX2_PLAIN_SAMPLER", "1"},
+            std::pair{"EDEN_NX2_BLEND_ALWAYS", "1"},
+        }) {
+            setenv(name, value, 0);
+        }
+#endif
         // Where a frame goes, from a normal build (performance.h, perf_report).
         if (const char* const report = std::getenv("EDEN_PERF_REPORT"); report && report[0] == '1') {
             Eden::Performance::perf_report = true;
