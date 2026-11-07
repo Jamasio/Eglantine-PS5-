@@ -577,8 +577,16 @@ int main(int argc, char** argv) {
                                           std::pair{"EDEN_NX2_UNBACKED_LIMIT", "0"}}) {
             setenv(name, value, 0);
         }
+        // The direct table removes the packed-entry decode from every A64 load/store. It is the
+        // console default: EDEN_JIT_TABLE=0 in env.txt remains an explicit rollback while the
+        // sparse-table probe still turns it off when the platform cannot provide sparse mappings.
+#ifdef PS5_NATIVE
+        setenv("EDEN_JIT_TABLE", "1", 0);
+#endif
         // Nearby A64 accesses share one page lookup (headless/dynarmic/page-reuse.cmake). The pass
-        // only acts on the direct table, EDEN_JIT_TABLE=1.
+        // only acts on the direct table; keep it on by default with the table and allow an explicit
+        // EDEN_JIT_PAGE_REUSE=0 rollback for A/B runs.
+        setenv("EDEN_JIT_PAGE_REUSE", "1", 0);
         if (const char* const reuse = std::getenv("EDEN_JIT_PAGE_REUSE"); reuse && reuse[0] == '1')
             eden_page_reuse = true;
         // JIT code generation, read before the first block compiles. EDEN_JIT_CODEGEN=1 turns all

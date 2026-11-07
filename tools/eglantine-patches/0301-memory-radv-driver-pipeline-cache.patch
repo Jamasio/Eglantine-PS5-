@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sat, 7 Nov 2026 00:00:00 +0000
+Subject: [PATCH] vulkan: do not duplicate RADV's pipeline cache
+
+The per-game Vulkan pipeline cache is kept for every pipeline compiled during
+one session. Flushing it serializes the growing cache but does not release its
+entries. On the PS5 the renderer is RADV, so keeping Eden's cache alongside the
+driver cache duplicates that lifetime across area changes. The existing helper
+already disables the Eden cache for the proprietary NVIDIA and AMD drivers;
+RADV belongs to the same class for this purpose.
+
+The regular Eden graphics/compute pipeline maps remain unchanged and still
+provide the per-game cache and eviction policy. This only prevents the second
+VkPipelineCache from retaining compile state on RADV.
+
+Confirm on the console with identical warm area-change runs: the RADV driver id
+must be present, `vulkan_pipelines.bin` must no longer be loaded/written, and
+`EDEN_POOL_LEDGER`/`EDEN_MEMORY` should show a higher largest free block without
+an increasing pipeline-cache contribution. If the target reports a different
+driver id, this patch is intentionally a no-op and that log is required before
+changing the predicate.
+
+---
+ src/video_core/renderer_vulkan/vk_pipeline_cache.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -431,6 +431,7 @@ bool DriverCachesPipelines(const Device& device) {
+     switch (device.GetDriverID()) {
+     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+     case VK_DRIVER_ID_AMD_PROPRIETARY:
++    case VK_DRIVER_ID_MESA_RADV:
+         return true;
+     default:
+         return false;
+     }
