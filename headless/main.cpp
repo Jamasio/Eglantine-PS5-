@@ -587,6 +587,14 @@ int main(int argc, char** argv) {
         // only acts on the direct table; keep it on by default with the table and allow an explicit
         // EDEN_JIT_PAGE_REUSE=0 rollback for A/B runs.
         setenv("EDEN_JIT_PAGE_REUSE", "1", 0);
+        // These maintainer fixes are safe PS5 fallbacks: env.txt can still disable either with =0.
+#ifdef PS5_NATIVE
+        // A CPU write to a GPU-written command-list page must invalidate the front's stale copy
+        // before the next list, rather than waiting for a later fence.
+        setenv("EDEN_NX2_LIST_CPU_SYNC", "1", 0);
+        // Native channels never consume their inline-upload bookkeeping list; do not grow it.
+        setenv("EDEN_NX2_NO_UPLOAD_STORE", "1", 0);
+#endif
         if (const char* const reuse = std::getenv("EDEN_JIT_PAGE_REUSE"); reuse && reuse[0] == '1')
             eden_page_reuse = true;
         // JIT code generation, read before the first block compiles. EDEN_JIT_CODEGEN=1 turns all
