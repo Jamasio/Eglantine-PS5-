@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: EglantinePS5 <noreply@eglantineps5.local>
+Date: Sun, 8 Nov 2026 00:00:00 +0000
+Subject: [PATCH] gpu_thread: poll Ocarina semaphore waits at 50 us
+
+Port zortos293/Lichii #446's measured wait-path mechanism into the PS5 GPU
+thread. A pending semaphore release is guest memory, so it cannot wake the
+host thread. Poll for 50 us while a frame-sized wait is in progress, then
+fall back to a 1 ms sleep after two seconds for menus and loading screens.
+
+Evidence: Lichii #446 measured Ocarina's Kokiri-village GPU-fence wait at
+about 17 ms/frame with 1 ms polls and about 1 ms/frame with 50 us polls;
+the source reports about 330 pending waits/s. This is a prediction for PS5,
+not a PS5 measurement. The PS5 build already uses the split GPU thread and
+its existing 500 us yield window, so only the sleep interval is changed; the
+Linux-only timer-slack adjustment from the desktop patch does not apply.
+
+Break risk: the 50 us polling interval consumes more Zen 2 CPU time while a
+channel is suspended and can reduce game-thread throughput or battery/power
+headroom. If RADV or the PS5 scheduler does not benefit from the shorter
+wake, the console should show equal or lower fps and higher GPU-thread CPU
+usage; the 2 s fallback preserves long-wait behavior. A wrong wake ordering
+would show as a guest hang or GPU-thread watchdog report, so compare fps,
+EDEN_PERF_THREAD and watchdog output against the control build.
+
+---
+ src/video_core/gpu_thread.cpp | 20 ++++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/src/video_core/gpu_thread.cpp b/src/video_core/gpu_thread.cpp
+--- a/src/video_core/gpu_thread.cpp
++++ b/src/video_core/gpu_thread.cpp
+@@ -74,18 +74,22 @@
+                 }
+                 if (!state.queue.TryPop(next)) {
+                     // The CPU usually releases the semaphore soon after: poll for half a
+-                    // millisecond before sleeping, or every wait also waits out a host sleep
+-                    // (title 1 waits ~25 times a second).
++                    // millisecond, then in short sleeps. Ocarina of Time waits here about 330
++                    // times a second and its present waits for the work behind them: Lichii #446
++                    // measured about 17 ms/frame of fence wait with 1 ms polls and about 1 ms with
++                    // 50 us polls in Kokiri village. A channel still waiting after 2 s (menus and
++                    // loading) does not need the tighter poll.
+                     Profile::Scope scope{Profile::Zone::PendingSleep};
+-                    if (std::chrono::steady_clock::now() - last_progress <
+-                        std::chrono::microseconds{500}) {
++                    const auto waited = std::chrono::steady_clock::now() - last_progress;
++                    if (waited < std::chrono::microseconds{500}) {
+                         std::this_thread::yield();
+                         continue;
+                     }
+-                    // Then sleep until the CPU submits more work, polling the semaphores every
+-                    // quarter millisecond (a release is a plain guest memory write that wakes
+-                    // nothing). A fixed 1 ms sleep let new submissions wait out the rest of it.
+-                    if (!state.queue.PopWaitFor(next, std::chrono::microseconds{250})) {
++                    if (waited < std::chrono::seconds{2}) {
++                        std::this_thread::sleep_for(std::chrono::microseconds{50});
++                        continue;
++                    }
++                    if (!state.queue.PopWaitFor(next, std::chrono::milliseconds{1})) {
+                         continue;
+                     }
+                 }
+-- 
+2.39.0
