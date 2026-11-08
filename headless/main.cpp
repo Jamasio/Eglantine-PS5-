@@ -523,7 +523,9 @@ int main(int argc, char** argv) {
         bool autoboot_pending = false;
         std::string development_id;
 #endif
-        setenv("EDEN_NX2_SPARSE_UNBACKED", "1", 1);
+        // Unbacked sparse images read as zeros, so a surface that needs one comes out black. Keep
+        // the default, but let env.txt take it back for an A/B: with the overwrite it could not.
+        setenv("EDEN_NX2_SPARSE_UNBACKED", "1", 0);
         setenv("EDEN_HOST_RESERVE_TRANSFER", "1", 1);
         // Settings > Diagnostics > Testing switches (test_switches.h): the same NAME=VALUE lines,
         // chosen in the menu. The app folder's env.txt below wins over them.
@@ -689,7 +691,21 @@ int main(int argc, char** argv) {
             std::pair{"EDEN_NX2_TRANSCODE_WAIT", "1"},
             std::pair{"EDEN_NX2_BUFFER_DOWNLOADS", "0"},
             std::pair{"EDEN_NX2_NATIVE_GRAPHICS_SIZE", "1"},
-            std::pair{"EDEN_NX2_TABLE_POOL_MIB", "64"},
+            // Ocarina of Time's fog classifier reads its spherical-harmonic light probes through a
+            // pointer table; those records sit 104-122 MiB past the pointer (Lichii #292). With
+            // the read-only pool capped at 64 MiB the reads come back zero, the outdoor fog loses
+            // its blue ambient term and becomes a white haze over the scene, Link included. 128
+            // MiB covers the records. Paired with EDEN_NX2_NATIVE_TABLES=compute this is the
+            // combination reported fixed on a base PS5 (viejunerd/Eglantine-PS5- issue 21).
+            std::pair{"EDEN_NX2_TABLE_POOL_MIB", "128"},
+            // Keep native pointer tables on the compute side only. With tables on for every stage
+            // a run died on memory while translating mesh programs; the fog classifier is compute,
+            // so it keeps its pointers and the graphics stages stop paying for theirs.
+            std::pair{"EDEN_NX2_NATIVE_TABLES", "compute"},
+            // The shader-side fog/exposure workaround scales volumetric fog to a quarter. That was
+            // meant to be opt-in (A-Man-With-A-Plan-dev 2f1668f283) and it is what thins the fog we
+            // want to keep.
+            std::pair{"EDEN_NX2_OOT_VISUAL_WORKAROUND", "0"},
             std::pair{"EDEN_NX2_TIGHT_DESCRIPTOR_TABLES", "1"},
             std::pair{"EDEN_NX2_SSBO_WRITES_SIZED", "1"},
             std::pair{"EDEN_NX2_UBO_INPLACE", "1"},
