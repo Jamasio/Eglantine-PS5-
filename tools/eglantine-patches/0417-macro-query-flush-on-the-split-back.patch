@@ -1,0 +1,42 @@
+From: EglantinePS5 <noreply@eglantineps5.local>
+Subject: [PATCH] macro: flush the query cache on the split's back thread
+
+EDEN_NX2_MACRO_QUERY_FLUSH=1 writes held query and semaphore reports out before a native MME DMA
+read, or occlusion predicates read stale values. The flush was skipped whenever the GPU split was
+active, because the query cache belongs to the split's back and the front must not record into the
+Vulkan scheduler (zortos293/Lichii 12db3f599: Kirby Air Riders crashed at its title in
+CommandChunk::Record). With EDEN_NX2_SPLIT=2 - the default - that left the fix doing nothing at all,
+which is what Eglantine #655's port here says of itself.
+
+Run it through GpuSplit::RunOnBack instead. That is a direct call when it is already on the back,
+a defer-and-drain from the front, and an immediate call with no split - the same shape the
+neighbouring QueryDma::BeforeRead/AfterBufferFlush calls use behind owns_caches.
+
+What this can break: RunOnBack drains the back and waits, so a flush reached from the front while
+the back is busy costs a wait per native MME DMA read. A wrong drain can also expose split
+ordering bugs. It stays behind EDEN_NX2_MACRO_QUERY_FLUSH, so nothing changes unless it is set.
+
+Checked: applies to the tree the 0410-0414 stack produces. Not run on a console.
+
+diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -1546,8 +1546,16 @@
+                         VideoCommon::QueryDma::BeforeRead(memory, maxwell3d.Rasterizer(), method,
+                                                           address, source, read_bytes);
+                     }
+-                    if (flush_queries && !VideoCommon::GpuSplit::Get().Active()) {
+-                        memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
++                    if (flush_queries) {
++                        // The query cache belongs to the split's back. Flushing it from the front
++                        // records into the Vulkan scheduler on the wrong thread (zortos293/Lichii
++                        // 12db3f599: Kirby Air Riders crashed at its title). RunOnBack is a direct
++                        // call on the back, and a defer-and-drain from the front. Without a split it
++                        // still calls through at once.
++                        VideoCommon::GpuSplit::Get().RunOnBack([&] {
++                            memory.FlushRegion(source, read_bytes,
++                                               VideoCommon::CacheType::QueryCache);
++                        });
+                     }
+                     if (memory.IsMemoryDirty(source, read_bytes, VideoCommon::CacheType::BufferCache)) {
+                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::BufferCache);
