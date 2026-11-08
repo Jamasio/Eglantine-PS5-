@@ -691,14 +691,11 @@ int main(int argc, char** argv) {
             std::pair{"EDEN_NX2_TRANSCODE_WAIT", "1"},
             std::pair{"EDEN_NX2_BUFFER_DOWNLOADS", "0"},
             std::pair{"EDEN_NX2_NATIVE_GRAPHICS_SIZE", "1"},
-            // Ocarina of Time's fog classifier reads its spherical-harmonic light probes through a
-            // pointer table; those records sit 104-122 MiB past the pointer (Lichii #292). With
-            // the read-only pool capped at 64 MiB the reads come back zero, the outdoor fog loses
-            // its blue ambient term and becomes a white haze over the scene, Link included. 128
-            // MiB covers the records. With EDEN_NX2_NATIVE_TABLES=1 and the workaround off below,
-            // this is the triple the port's own test build shipped and tested for the white fog
-            // (docs/ocarina-test-1-changes.md).
-            std::pair{"EDEN_NX2_TABLE_POOL_MIB", "128"},
+            // EDEN_NX2_TABLE_POOL_MIB is deliberately NOT set. 0418 made it only a tightening cap:
+            // a read-only table pointer is now bound to the end of its mapping, as far as the
+            // device allows (at most 1 GiB), per Lichii #351. Ocarina of Time's light probe records
+            // reach about 130 MiB past the pointer, so the 128 MiB that used to be baked here cut
+            // the far probes off - which is the "exposure jumped 3-4x" that Fritchii describes.
             // Native pointer tables for EVERY stage, which is what the port's own test build
             // shipped and tested (docs/ocarina-test-1-changes.md, "White fog outdoors"): the fog
             // reads its light probes through pointers in tables and those reads came back zero.
