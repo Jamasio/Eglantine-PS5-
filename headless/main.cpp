@@ -614,6 +614,9 @@ int main(int argc, char** argv) {
         setenv("EDEN_PERF_REPORT", "1", 0);
         setenv("EDEN_GPU_TIME", "1", 0);
         setenv("EDEN_NX2_QUERY_KEEP_PENDING", "1", 0);
+        // AMD OoT reports lost HUD/minimap/dialog draws when render-pass dependencies are
+        // incomplete. The measured AMD fix costs about 0.05 ms/frame; env.txt may still set =0.
+        setenv("EDEN_NX2_RP_BARRIER", "1", 0);
 #endif
 #ifdef PS5_NATIVE
         // Smaller dispatch tables save committed heap without changing the fallback path.
