@@ -57,3 +57,58 @@ diff --git a/src/video_core/renderer_vulkan/vk_buffer_cache.cpp b/src/video_core
  std::optional<Buffer> BufferCacheRuntime::TryCreateBuffer(DAddr cpu_addr, u64 size,
                                                            bool sparse_compatible) {
      try {
+diff --git a/src/video_core/renderer_opengl/gl_buffer_cache.h b/src/video_core/renderer_opengl/gl_buffer_cache.h
+--- a/src/video_core/renderer_opengl/gl_buffer_cache.h
++++ b/src/video_core/renderer_opengl/gl_buffer_cache.h
+@@ -207,6 +207,13 @@
+         return static_cast<u32>(device.GetShaderStorageBufferAlignment());
+     }
+ 
++    /// Largest range a storage buffer binding may have: the driver's storage block size. It
++    /// doesn't depend on the binding mode, since bindings are cached across pipelines; a bindless
++    /// (GLASM) binding's GLsizei length holds it, as the buffer cache stops at 1 GiB.
++    u64 GetMaxStorageBufferRange() const {
++        return device.GetMaxShaderStorageBlockSize();
++    }
++
+ private:
+     static constexpr std::array PABO_LUT{
+         GL_VERTEX_PROGRAM_PARAMETER_BUFFER_NV,          GL_TESS_CONTROL_PROGRAM_PARAMETER_BUFFER_NV,
+diff --git a/src/video_core/renderer_opengl/gl_device.h b/src/video_core/renderer_opengl/gl_device.h
+--- a/src/video_core/renderer_opengl/gl_device.h
++++ b/src/video_core/renderer_opengl/gl_device.h
+@@ -35,6 +35,11 @@
+         return shader_storage_alignment;
+     }
+ 
++    /// GL_MAX_SHADER_STORAGE_BLOCK_SIZE: the largest range of a storage buffer binding
++    u64 GetMaxShaderStorageBlockSize() const {
++        return max_shader_storage_block_size;
++    }
++
+     u32 GetMaxVertexAttributes() const {
+         return max_vertex_attributes;
+     }
+@@ -202,6 +207,7 @@
+     std::array<u32, Shader::MaxStageTypes> max_uniform_buffers{};
+     size_t uniform_buffer_alignment{};
+     size_t shader_storage_alignment{};
++    u64 max_shader_storage_block_size{};
+     u32 max_vertex_attributes{};
+     u32 max_varyings{};
+     u32 max_compute_shared_memory_size{};
+diff --git a/src/video_core/renderer_opengl/gl_device.cpp b/src/video_core/renderer_opengl/gl_device.cpp
+--- a/src/video_core/renderer_opengl/gl_device.cpp
++++ b/src/video_core/renderer_opengl/gl_device.cpp
+@@ -199,6 +199,11 @@
+     max_uniform_buffers = BuildMaxUniformBuffers();
+     uniform_buffer_alignment = GetInteger<size_t>(GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT);
+     shader_storage_alignment = GetInteger<size_t>(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT);
++    // A 64-bit query: drivers report sizes past 2 GiB. GL guarantees at least 2^27.
++    GLint64 max_storage_block_size{};
++    glGetInteger64v(GL_MAX_SHADER_STORAGE_BLOCK_SIZE, &max_storage_block_size);
++    max_shader_storage_block_size =
++        static_cast<u64>((std::max)(max_storage_block_size, GLint64{1} << 27));
+     max_vertex_attributes = GetInteger<u32>(GL_MAX_VERTEX_ATTRIBS);
+     max_varyings = GetInteger<u32>(GL_MAX_VARYING_VECTORS);
+     max_compute_shared_memory_size = GetInteger<u32>(GL_MAX_COMPUTE_SHARED_MEMORY_SIZE);
