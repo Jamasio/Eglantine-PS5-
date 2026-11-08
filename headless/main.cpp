@@ -695,13 +695,18 @@ int main(int argc, char** argv) {
             // pointer table; those records sit 104-122 MiB past the pointer (Lichii #292). With
             // the read-only pool capped at 64 MiB the reads come back zero, the outdoor fog loses
             // its blue ambient term and becomes a white haze over the scene, Link included. 128
-            // MiB covers the records. Paired with EDEN_NX2_NATIVE_TABLES=compute this is the
-            // combination reported fixed on a base PS5 (viejunerd/Eglantine-PS5- issue 21).
+            // MiB covers the records. With EDEN_NX2_NATIVE_TABLES=1 and the workaround off below,
+            // this is the triple the port's own test build shipped and tested for the white fog
+            // (docs/ocarina-test-1-changes.md).
             std::pair{"EDEN_NX2_TABLE_POOL_MIB", "128"},
-            // Keep native pointer tables on the compute side only. With tables on for every stage
-            // a run died on memory while translating mesh programs; the fog classifier is compute,
-            // so it keeps its pointers and the graphics stages stop paying for theirs.
-            std::pair{"EDEN_NX2_NATIVE_TABLES", "compute"},
+            // Native pointer tables for EVERY stage, which is what the port's own test build
+            // shipped and tested (docs/ocarina-test-1-changes.md, "White fog outdoors"): the fog
+            // reads its light probes through pointers in tables and those reads came back zero.
+            // =compute is a test-only mode - it takes the =0 path for vertex, fragment, task and
+            // mesh programs, which broke the water reflection on a T49 hand test, and it leaves the
+            // graphics stages without the pointer reads Ocarina's character lighting uses. Do not
+            // ship it: a pause-menu Link came out black except the eyes.
+            std::pair{"EDEN_NX2_NATIVE_TABLES", "1"},
             // The shader-side fog/exposure workaround scales volumetric fog to a quarter. That was
             // meant to be opt-in (A-Man-With-A-Plan-dev 2f1668f283) and it is what thins the fog we
             // want to keep.
