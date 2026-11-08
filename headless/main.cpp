@@ -607,6 +607,12 @@ int main(int argc, char** argv) {
         // query report that stays pending (the second flash line). The shipped Faster env.txt sets
         // neither, so these take effect; an explicit env.txt line still overrides either one.
         setenv("EDEN_NX2_RADV_MESH_COMPUTE_LONE", "1", 0);
+        // Measurement build: the owner cannot edit env.txt, so the two profilers that decide
+        // the next optimisation ship on. EDEN_PERF_REPORT prints where a frame goes each run and
+        // the per-thread cpu_ms/wall_ms that separates "CPU-bound" from "waiting on a stall";
+        // EDEN_GPU_TIME writes the GPU busy share to heap.log every 5 s. Both are prints only.
+        setenv("EDEN_PERF_REPORT", "1", 0);
+        setenv("EDEN_GPU_TIME", "1", 0);
         setenv("EDEN_NX2_QUERY_KEEP_PENDING", "1", 0);
 #endif
 #ifdef PS5_NATIVE
