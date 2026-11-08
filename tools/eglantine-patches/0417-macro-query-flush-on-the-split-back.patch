@@ -21,18 +21,28 @@ Checked: applies to the tree the 0410-0414 stack produces. Not run on a console.
 diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
 --- a/src/video_core/macro.cpp
 +++ b/src/video_core/macro.cpp
-@@ -1546,8 +1546,16 @@
-                         VideoCommon::QueryDma::BeforeRead(memory, maxwell3d.Rasterizer(), method,
-                                                           address, source, read_bytes);
+@@ -1530,6 +1530,12 @@
+                             }
+                         }
                      }
--                    if (flush_queries && !VideoCommon::GpuSplit::Get().Active()) {
--                        memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
-+                    if (flush_queries) {
-+                        // The query cache belongs to the split's back. Flushing it from the front
-+                        // records into the Vulkan scheduler on the wrong thread (zortos293/Lichii
-+                        // 12db3f599: Kirby Air Riders crashed at its title). RunOnBack is a direct
-+                        // call on the back, and a defer-and-drain from the front. Without a split it
-+                        // still calls through at once.
++                    // EDEN_NX2_MACRO_QUERY_FLUSH=1: write held query reports out before the game
++                    // consumes them, including through the split's back (see below).
++                    static const bool flush_queries = [] {
++                        const char* const flush = std::getenv("EDEN_NX2_MACRO_QUERY_FLUSH");
++                        return flush != nullptr && flush[0] != '0';
++                    }();
+                     const bool owns_caches = !VideoCommon::GpuSplit::Get().Active() ||
+                                              VideoCommon::GpuSplit::OnBackThread();
+                     if (owns_caches) {
+@@ -1538,6 +1544,15 @@
+                         // Flush the report before the game consumes it. A short fence-flush delay
+                         // otherwise leaves a stale occlusion value for one frame and flashes white.
+                         memory.FlushRegion(source, read_bytes, VideoCommon::CacheType::QueryCache);
++                    } else if (flush_queries) {
++                        // The query cache belongs to the split's back, so the flush above cannot be
++                        // made from the front: recording into the Vulkan scheduler there crashed
++                        // Kirby Air Riders at its title (zortos293/Lichii 12db3f599). Run it on the
++                        // back instead of skipping it, which is what happened under EDEN_NX2_SPLIT=2.
 +                        VideoCommon::GpuSplit::Get().RunOnBack([&] {
 +                            memory.FlushRegion(source, read_bytes,
 +                                               VideoCommon::CacheType::QueryCache);

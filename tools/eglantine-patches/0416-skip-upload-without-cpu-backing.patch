@@ -22,7 +22,7 @@ Checked: applies to the tree the 0410-0414 stack produces. Not run on a console.
 diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
 --- a/src/video_core/texture_cache/texture_cache.h
 +++ b/src/video_core/texture_cache/texture_cache.h
-@@ -1978,6 +1978,19 @@
+@@ -2131,6 +2131,19 @@
          // Only upload modified images
          return;
      }
