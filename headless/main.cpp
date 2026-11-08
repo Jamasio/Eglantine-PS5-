@@ -711,14 +711,11 @@ int main(int argc, char** argv) {
             // meant to be opt-in (A-Man-With-A-Plan-dev 2f1668f283) and it is what thins the fog we
             // want to keep.
             std::pair{"EDEN_NX2_OOT_VISUAL_WORKAROUND", "0"},
-            // Eglantine #655, and the likely residual "fog over Link": Ocarina's predicate macro
-            // 0x142 read a stale "visible" record, ran its half-resolution depth clears every frame
-            // and drew the fog over Link and the terrain. The fix is the query-cache flush before
-            // the native MME DMA read. 0417 makes it run on the split's back, where the query cache
-            // lives under the default EDEN_NX2_SPLIT=2 - without that the flush was skipped
-            // entirely and 0145 did nothing. EDEN_NX2_MACRO_QUERY_FLUSH=0 turns it back off (the
-            // flush costs a back-thread drain per native MME DMA read).
-            std::pair{"EDEN_NX2_MACRO_QUERY_FLUSH", "1"},
+            // EDEN_NX2_MACRO_QUERY_FLUSH is deliberately NOT set. The split-safe flush written for
+            // Eglantine #655 (0417, since removed) hung the game on the SECOND pause-menu entry -
+            // the front drains the back while the back waits on work the front has to submit - and
+            // it made no visible difference to the fog it was meant to fix. 0402's own query flush
+            // in the DMA-read path is untouched and stays in place.
             std::pair{"EDEN_NX2_TIGHT_DESCRIPTOR_TABLES", "1"},
             std::pair{"EDEN_NX2_SSBO_WRITES_SIZED", "1"},
             std::pair{"EDEN_NX2_UBO_INPLACE", "1"},
