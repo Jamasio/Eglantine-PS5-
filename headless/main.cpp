@@ -617,6 +617,20 @@ int main(int argc, char** argv) {
         // AMD OoT reports lost HUD/minimap/dialog draws when render-pass dependencies are
         // incomplete. The measured AMD fix costs about 0.05 ms/frame; env.txt may still set =0.
         setenv("EDEN_NX2_RP_BARRIER", "1", 0);
+        // Ocarina lowers its own upscaling networks by default, but a stale
+        // EDEN_NX2_TENSOR_ONLY in the console's uneditable env.txt rejects the ten NDVE movie-filter
+        // programs and leaves the plain upscale stand-in (black movies: "Upscale fallback target ...
+        // 0/3597 non-zero"). Background builds them off the frame path rather than holding the
+        // scheduler ~12 s; compact is the cheap, measured-equivalent HMMA form.
+        setenv("EDEN_NX2_TENSOR_BACKGROUND", "1", 0);
+        setenv("EDEN_NX2_TENSOR", "compact", 0);
+        // The driver refused allocations at 7427 MiB of a 7805 MiB budget ("allocating it anyway",
+        // "unbacked sparse image", "No staging buffer"): an unbacked image reads as zeros and an
+        // un-uploaded one shows the last frame, which is the flicker. The settings menu's own 4 GB
+        // limit holds the collector under the failing 4352/5120 while staying above Ocarina's
+        // resident set. ApplyThresholdOverrides applies these last, so env.txt still overrides them.
+        setenv("EDEN_NX2_TC_CRITICAL_MIB", "4096", 0);
+        setenv("EDEN_NX2_TC_EXPECTED_MIB", "3328", 0);
 #endif
 #ifdef PS5_NATIVE
         // Smaller dispatch tables save committed heap without changing the fallback path.
