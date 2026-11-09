@@ -15,7 +15,26 @@ EDEN_NX2_NET_BARRIER=1
 EDEN_NX2_HANG_WATCH=1
 EDEN_NX2_OOT_DYNAMIC_FPS=1
 EDEN_NX2_TABLE_POOL_MIB=1024
-EDEN_NX2_OOT_VISUAL_WORKAROUND=0
+# --- Glitch round: fixes already compiled into this build, off unless set. ---
+# White/coloured material flashes: re-upload a native program's 64 KiB bank on
+# every bind instead of once per frame, because Ocarina rewrites per-draw
+# material data mid-frame. 1 = once per frame (the old behaviour), 0 = off.
+EDEN_NX2_BANK_REUPLOAD=2
+# Kokiri Forest haze: scales the fog shader this matches to 0.25 and the exposure
+# to 0.65. The previous profile had this workaround off, so nothing applied.
+# Tune with EDEN_NX2_OOT_FOG_SCALE / EDEN_NX2_OOT_EXPOSURE_SCALE (translated
+# every boot, no shader cache to clear).
+EDEN_NX2_OOT_VISUAL_WORKAROUND=1
+# Mesh programs that output points (topology 0) or lines (1) compile instead of
+# being refused, so their draws are no longer skipped (missing vegetation).
+EDEN_NX2_MESH_POINTS=1
+# Diagnostic: log a native program's pointer slot that held null at translation
+# and holds a pointer now -- the case where the binding is dropped and the disk
+# cache keeps that answer. 1 logs only; 2 rebuilds such programs, at most 4 a run.
+EDEN_NX2_NULL_SLOTS=1
+# Copy the 64 KiB bank straight in (Lichii PR 176) instead of marking and
+# reprotecting its pages each frame.
+EDEN_NX2_UBO_BANK_DIRECT=1
 EDEN_NX2_TRANSCODE_KEEP_MIB=32
 EDEN_NX2_TRANSCODE_WAIT=1
 EDEN_NX2_BC_COLLECT_MIB=256
