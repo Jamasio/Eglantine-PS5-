@@ -925,7 +925,7 @@ index 454f950d93..948e3d8bf7 100644
          scaled_info.size.height = scaled_height;
          scaled_image = MakeImage(runtime->device, runtime->memory_allocator, scaled_info,
 -                                 runtime->ViewFormats(info.format));
-+                                 runtime->ViewFormats(info.format), {}, false, false, false,
++                                 runtime->ViewFormats(info.format), {}, false, false,
 +                                 runtime, &scaled_pool_key);
          ignore = false;
      }
