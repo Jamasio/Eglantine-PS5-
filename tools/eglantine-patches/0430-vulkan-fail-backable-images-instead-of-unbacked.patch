@@ -1,0 +1,273 @@
+diff --git a/src/video_core/CMakeLists.txt b/src/video_core/CMakeLists.txt
+index a8ab730b32..94e40d2b27 100644
+--- a/src/video_core/CMakeLists.txt
++++ b/src/video_core/CMakeLists.txt
+@@ -231,6 +231,7 @@ add_library(video_core STATIC
+     vulkan_common/vulkan_instance.h
+     vulkan_common/vulkan_library.cpp
+     vulkan_common/vulkan_library.h
++    vulkan_common/unbacked_fallback.h
+     vulkan_common/vulkan_memory_allocator.cpp
+     vulkan_common/vulkan_memory_allocator.h
+     vulkan_common/vulkan_surface.cpp
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 82b97a656a..d80bf4a5f7 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -40,6 +40,7 @@
+ #include "video_core/texture_cache/samples_helper.h"
+ #include "video_core/texture_cache/util.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
++#include "video_core/vulkan_common/unbacked_fallback.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+ #ifdef EGLANTINE_STREAMLINE
+ #include "video_core/vulkan_common/streamline.h"
+@@ -558,7 +559,7 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
+                                   const ImageInfo& info, std::span<const VkFormat> view_formats,
+                                   std::optional<VkFormat> format_override = {},
+                                   bool unbacked = false, bool aliased = false,
+-                                  TextureCacheRuntime* pool = nullptr,
++                                  bool may_fail = false, TextureCacheRuntime* pool = nullptr,
+                                   ImagePoolKey* pool_key = nullptr, bool* pooled = nullptr) {
+     if (info.type == ImageType::Buffer) {
+         return vk::Image{};
+@@ -621,7 +622,7 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
+             return image;
+         }
+     }
+-    return allocator.CreateImage(image_ci);
++    return allocator.CreateImage(image_ci, false, may_fail);
+ }
+ 
+ [[nodiscard]] vk::ImageView MakeStorageView(const vk::Device& device, u32 level, VkImage image,
+@@ -2963,8 +2964,11 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+                                    IsUnwrittenSparse(runtime_.device, info, gpu_addr_),
+                                UsesSparseTiles(runtime_.device, info, gpu_addr_) &&
+                                    SparseTilesModeOf(runtime_.device) == SparseTilesMode::Aliased,
+-                               &runtime_, &original_pool_key, &from_pool)),
++                               true, &runtime_, &original_pool_key, &from_pool)),
+       aspect_mask(ImageAspectMask(info.format)) {
++    if (!original_image) {
++        return;
++    }
+     if (original_image.IsUnbacked()) {
+         flags |= VideoCommon::ImageFlagBits::Unbacked;
+         const ImageInfo host_info = TrimmedHostInfo(runtime_.device, info, host_level_offset);
+@@ -2980,7 +2984,7 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+             original_image = MakeHostImage(runtime_, info, host_level_offset, gpu_addr_, true);
+             if (!original_image.IsUnbacked()) {
+                 flags &= ~VideoCommon::ImageFlagBits::Unbacked;
+-            } else if (texels <= (u64{1} << 28)) {
++            } else if (texels <= MaxBackedImageTexels) {
+                 flags |= VideoCommon::ImageFlagBits::UnwrittenSparse;
+             }
+         } else if (UsesSparseTiles(runtime_.device, info, gpu_addr_)) {
+@@ -2994,11 +2998,11 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+                 original_image = MakeHostImage(runtime_, info, host_level_offset, gpu_addr_, true);
+                 if (!original_image.IsUnbacked()) {
+                     flags &= ~VideoCommon::ImageFlagBits::Unbacked;
+-                } else if (texels <= (u64{1} << 28)) {
++                } else if (texels <= MaxBackedImageTexels) {
+                     flags |= VideoCommon::ImageFlagBits::UnwrittenSparse;
+                 }
+             }
+-        } else if (texels <= (u64{1} << 28)) {
++        } else if (texels <= MaxBackedImageTexels) {
+             // Not too big to back (see MemoryAllocator::CreateImage): unbacked because nothing
+             // was written there yet, so the first write gets it replaced.
+             flags |= VideoCommon::ImageFlagBits::UnwrittenSparse;
+@@ -4160,7 +4164,7 @@ bool Image::ScaleUp(bool ignore) {
+         scaled_info.size.width = scaled_width;
+         scaled_info.size.height = scaled_height;
+         scaled_image = MakeImage(runtime->device, runtime->memory_allocator, scaled_info,
+-                                 runtime->ViewFormats(info.format), {}, false, false,
++                                 runtime->ViewFormats(info.format), {}, false, false, false,
+                                  runtime, &scaled_pool_key);
+         ignore = false;
+     }
+@@ -5049,8 +5053,8 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
+         pending = std::move(*reusable);
+         free_transcodes.erase(reusable);
+     } else {
+-        // With no memory the allocator gives an image with nothing bound (or, with no room for
+-        // that either, throws).
++        // With no memory the allocator gives a real image, an image with nothing bound for a
++        // caller that cannot fail, or null here because this decode can be retried.
+         vk::Image decode_image;
+         try {
+             decode_image = memory_allocator.CreateImage(VkImageCreateInfo{
+@@ -5069,7 +5073,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
+                 .queueFamilyIndexCount = 0,
+                 .pQueueFamilyIndices = nullptr,
+                 .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+-            }, true);
++            }, true, true);
+         } catch (const vk::Exception& refused) {
+             if (refused.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+                 throw;
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.h b/src/video_core/renderer_vulkan/vk_texture_cache.h
+index 8ca1b369d3..06d2dd034e 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.h
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.h
+@@ -509,6 +509,11 @@ public:
+                    VAddr cpu_addr);
+     explicit Image(const VideoCommon::NullImageParams&);
+ 
++    /// No memory was left for a backable cache image; the cache drops it and retries later.
++    [[nodiscard]] bool OutOfMemory() const noexcept {
++        return !original_image && info.type != VideoCommon::ImageType::Buffer;
++    }
++
+     ~Image();
+ 
+     Image(const Image&) = delete;
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index 4cf2dcde8e..b166d464d2 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -3777,6 +3777,18 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
+         make_image();
+     }
+     Image& new_image = slot_images[new_image_id];
++    if constexpr (requires(const Image& image) { image.OutOfMemory(); }) {
++        if (new_image.OutOfMemory()) {
++            slot_images.erase(new_image_id);
++            image_refused = true;
++            const u64 image_bytes = CalculateGuestSizeInBytes(new_info);
++            image_refused_until = std::chrono::steady_clock::now() + std::chrono::seconds(1);
++            image_refused_bytes = image_bytes;
++            LOG_ERROR(HW_GPU, "No memory for the image at {:#x} ({}x{}, {} MiB): left out",
++                      gpu_addr, new_info.size.width, new_info.size.height, image_bytes >> 20);
++            return ImageId{};
++        }
++    }
+ 
+     new_image.allocation_tick = frame_tick;
+     {
+diff --git a/src/video_core/vulkan_common/unbacked_fallback.h b/src/video_core/vulkan_common/unbacked_fallback.h
+new file mode 100644
+index 0000000000..aa450272f6
+--- /dev/null
++++ b/src/video_core/vulkan_common/unbacked_fallback.h
+@@ -0,0 +1,22 @@
++// SPDX-FileCopyrightText: Copyright 2026 Eden Emulator Project
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++#pragma once
++
++#include "common/common_types.h"
++
++namespace Vulkan {
++
++/// Images over this texel count may not be backed by a normal allocation. The byte-size probe in
++/// MemoryAllocator may still back a manageable large image, but this ceiling controls the sparse
++/// fallback when allocation cannot be satisfied.
++constexpr u64 MaxBackedImageTexels = u64{1} << 28;
++
++/// Whether an allocation failure may use an unbacked sparse image instead of returning null.
++/// A caller that can retry (the texture cache) gets null for backable images; callers that cannot
++/// fail keep the compatibility fallback. Images beyond the ceiling always remain eligible for it.
++constexpr bool UsesUnbackedFallback(u64 texels, bool may_fail) {
++    return texels > MaxBackedImageTexels || !may_fail;
++}
++
++} // namespace Vulkan
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+index 52c5f2ba66..0b53b15bef 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.cpp
+@@ -20,6 +20,7 @@
+ #include "common/literals.h"
+ #include "common/logging.h"
+ #include <ranges>
++#include "video_core/vulkan_common/unbacked_fallback.h"
+ #include "video_core/vulkan_common/vma.h"
+ #include "video_core/vulkan_common/vulkan_device.h"
+ #include "video_core/vulkan_common/vulkan_memory_allocator.h"
+@@ -207,7 +208,8 @@ MemoryAllocator::MemoryAllocator(const Device &device_)
+ 
+ MemoryAllocator::~MemoryAllocator() = default;
+ 
+-vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated) const
++vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicated,
++                                       bool may_fail) const
+ {
+     const VmaAllocationCreateInfo alloc_ci = {
+             // Best fit: images freed by the thousand leave holes in the blocks, which new ones
+@@ -228,9 +230,9 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
+     VkImage handle{};
+     VmaAllocation allocation{};
+     VmaAllocationInfo alloc_info{};
+-    // Images this large (title 1's sparse texture arrays reach 4.5G texels, ~23 GB) are never
+-    // backed: VMA would quietly place them in system memory once VRAM is full. They take the
+-    // unbacked sparse fallback below.
++    // Images this large (title 1's sparse texture arrays reach 4.5G texels, ~23 GB) normally take
++    // the unbacked path: VMA would otherwise place them in system memory once VRAM is full. The
++    // byte probe below retains a real backing for a large image whose actual requirement is modest.
+     const u64 texels = u64{ci.extent.width} * ci.extent.height * ci.extent.depth * ci.arrayLayers;
+     // The texel count is only a filter: what the image needs depends on its format, levels, layers
+     // and alignment. Ocarina of Time's sun shadow map is 18432x18432 D16 - 339M texels, past the
+@@ -242,8 +244,8 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
+         const char* const value = std::getenv("EDEN_NX2_ALLOC_BYTES");
+         return value == nullptr || value[0] != '0';
+     }();
+-    bool huge = !bytes_policy && texels > (u64{1} << 28);
+-    if (bytes_policy && texels > (u64{1} << 28)) {
++    bool huge = !bytes_policy && texels > MaxBackedImageTexels;
++    if (bytes_policy && texels > MaxBackedImageTexels) {
+         VkMemoryRequirements requirements{};
+         VkImage probe = VK_NULL_HANDLE;
+         if (device.GetDispatchLoader().vkCreateImage(*device.GetLogical(), &ci, nullptr, &probe) ==
+@@ -291,13 +293,15 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
+                         ci.arrayLayers, static_cast<u32>(ci.format));
+         }
+     }
+-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D) {
++    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY && ci.imageType != VK_IMAGE_TYPE_1D &&
++        UsesUnbackedFallback(texels, may_fail)) {
+         if (!huge) {
+             pressure_events.fetch_add(1, std::memory_order_relaxed);
+         }
+         // Too big to back at all, e.g. title 1's sparse virtual texture arrays (8192x8192,
+         // 68 layers, ~23 GB): on the console only resident tiles have memory. Use an image with
+-        // nothing bound, so views and copies still work, instead of aborting.
++        // nothing bound, so views and copies still work, instead of aborting. A backable image
++        // requested by a may-fail caller returns null below instead.
+         if (vk::Image sparse = CreateUnbackedImage(ci)) {
+             LOG_WARNING(Render_Vulkan,
+                         "Image {}x{}x{} ({} levels, {} layers, format {}) does not fit; using an "
+@@ -308,6 +312,18 @@ vk::Image MemoryAllocator::CreateImage(const VkImageCreateInfo &ci, bool dedicat
+         }
+     }
+     if (result != VK_SUCCESS) {
++        if (may_fail && (result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
++                         result == VK_ERROR_OUT_OF_HOST_MEMORY)) {
++            static u32 refused_logged{};
++            if (refused_logged++ < 32) {
++                LOG_WARNING(Render_Vulkan,
++                            "Image {}x{}x{} ({} levels, {} layers, format {}) does not fit; "
++                            "returning null to a caller that can retry",
++                            ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
++                            ci.arrayLayers, static_cast<u32>(ci.format));
++            }
++            return vk::Image{};
++        }
+         LOG_CRITICAL(Render_Vulkan, "Image {}x{}x{} ({} levels, {} layers, format {}) failed: {}",
+                      ci.extent.width, ci.extent.height, ci.extent.depth, ci.mipLevels,
+                      ci.arrayLayers, static_cast<u32>(ci.format), static_cast<int>(result));
+diff --git a/src/video_core/vulkan_common/vulkan_memory_allocator.h b/src/video_core/vulkan_common/vulkan_memory_allocator.h
+index d1df00864d..9e445921c7 100644
+--- a/src/video_core/vulkan_common/vulkan_memory_allocator.h
++++ b/src/video_core/vulkan_common/vulkan_memory_allocator.h
+@@ -108,7 +108,10 @@ namespace Vulkan {
+ 
+         /// `dedicated`: own device memory, returned to the driver on destruction (short-lived
+         /// images would otherwise leave holes in the shared blocks).
+-        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false) const;
++        /// `may_fail`: return a null image when a backable image cannot be allocated. Images over
++        /// the texel ceiling, and callers that cannot fail, may use the unbacked fallback.
++        vk::Image CreateImage(const VkImageCreateInfo &ci, bool dedicated = false,
++                              bool may_fail = false) const;
+ 
+         /// A sparse resident image with nothing bound (reads return zero, writes are dropped), or
+         /// a null image when the device can't make one.
