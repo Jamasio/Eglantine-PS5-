@@ -67,3 +67,11 @@ EDEN_NX2_TC_KEEP_ASYNC=1800
 EDEN_NX2_MACRO_QUERY_FLUSH=0
 EDEN_NX2_RADV_MESH_COMPUTE_LONE=1
 EDEN_NX2_QUERY_KEEP_PENDING=1
+
+# --- Per-draw cost (measured in this port's own comment) ---
+# A written native storage binding is currently marked GPU-written WHOLE -- up to 8 MiB, including
+# "data the program never touched" (buffer_cache.h:875-879). Sizing it to the word after the
+# pointer is the port's own measured win: 30 ms a frame -> 21 with every binding sized. This is the
+# opposite side of Fritchii's v5.6 fix: they removed a 64 KiB CAP that left writes untracked; our
+# tree has no cap and over-marks instead, so it carries the cost without the bug.
+EDEN_NX2_SSBO_WRITES_SIZED=1
